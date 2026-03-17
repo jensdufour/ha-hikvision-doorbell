@@ -1,0 +1,24 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Connect to Hikvision Doorbell",
+                "description": "Enter the connection details for your Hikvision doorbell.",
+                "data": {
+                    "name": "Name",
+                    "host": "Host (IP address)",
+                    "username": "Username",
+                    "password": "Password"
+                }
+            }
+        },
+        "error": {
+            "cannot_connect": "Failed to connect to the doorbell. Check the IP address and network.",
+            "invalid_auth": "Invalid username or password.",
+            "unknown": "An unexpected error occurred."
+        },
+        "abort": {
+            "already_configured": "This doorbell is already configured."
+        }
+    }
+}
