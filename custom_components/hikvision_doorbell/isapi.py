@@ -361,21 +361,22 @@ class HikvisionISAPIClient:
         Returns the response text.
         """
         ns = "http://www.isapi.org/ver20/XMLSchema"
+        # Format XML exactly as the device returns it (with newlines)
         xml_body = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            f'<HttpHostNotification version="2.0" xmlns="{ns}">'
-            f"<id>{host_id}</id>"
-            f"<url>{url_path}</url>"
-            "<protocolType>HTTP</protocolType>"
-            "<parameterFormatType>XML</parameterFormatType>"
-            "<addressingFormatType>ipaddress</addressingFormatType>"
-            f"<ipAddress>{ip}</ipAddress>"
-            f"<portNo>{port}</portNo>"
-            "<httpAuthenticationMethod>none</httpAuthenticationMethod>"
-            "</HttpHostNotification>"
+            '<?xml version="1.0" encoding="UTF-8"?>\r\n'
+            f'<HttpHostNotification version="2.0" xmlns="{ns}">\r\n'
+            f"<id>{host_id}</id>\r\n"
+            f"<url>{url_path}</url>\r\n"
+            "<protocolType>HTTP</protocolType>\r\n"
+            "<parameterFormatType>XML</parameterFormatType>\r\n"
+            "<addressingFormatType>ipaddress</addressingFormatType>\r\n"
+            f"<ipAddress>{ip}</ipAddress>\r\n"
+            f"<portNo>{port}</portNo>\r\n"
+            "<httpAuthenticationMethod>none</httpAuthenticationMethod>\r\n"
+            "</HttpHostNotification>\r\n"
         )
 
-        _LOGGER.warning("Sending HTTP host config XML: %s", xml_body)
+        _LOGGER.warning("Sending HTTP host config XML:\n%s", xml_body)
 
         # Try PUT first (update existing host 1), fall back to POST (create)
         for method in ("PUT", "POST"):
