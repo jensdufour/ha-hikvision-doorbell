@@ -19,7 +19,7 @@ from .isapi import HikvisionISAPIClient, HikvisionISAPIError
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["binary_sensor", "image"]
-_VERSION = "1.2.6"
+_VERSION = "1.3.0"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -49,6 +49,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         client=client,
         name=entry.data["name"],
         device_info=device_info,
+        sdk_port=entry.data.get("sdk_port", 8000),
     )
     await coordinator.async_config_entry_first_refresh()
 
@@ -63,7 +64,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Register webhook for event push from the doorbell
+    # Start the SDK binary protocol connection for real-time ring detection
+    # This is the primary ring detection mechanism (reverse-engineered SDK protocol)
+    hass.async_create_task(
+        coordinator.start_sdk_listener(
+            host=entry.data["host"],
+            username=entry.data["username"],
+            password=entry.data["password"],
+        )
+    )
+
+    # Register webhook as fallback for event push from the doorbell
     webhook_id = f"{WEBHOOK_ID_PREFIX}_{entry.entry_id}"
     webhook.async_register(
         hass,
@@ -75,16 +86,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     _LOGGER.info("Registered webhook %s for doorbell events", webhook_id)
 
-    # Try to configure the doorbell to push events to our webhook
+    # Configure doorbell HTTP push as a secondary mechanism (fallback)
     hass.async_create_task(
         _configure_doorbell_push(hass, client, webhook_id, entry)
     )
 
-    # Probe endpoints in background for diagnostics
-    hass.async_create_task(client.probe_endpoints())
-
-    # alertStream confirmed non-functional on this device model
-    # (returns fixed 40-byte XML declaration, not a real stream)
+    # ISAPI alertStream and endpoint probing confirmed non-functional on
+    # this device model. SDK protocol is the primary detection mechanism.
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -277,6 +285,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator: HikvisionDoorbellCoordinator = hass.data[DOMAIN].pop(
             entry.entry_id
         )
+        # Stop SDK protocol connection
+        await coordinator.stop_sdk()
         # Try to clean up HTTP host config on the doorbell
         try:
             await coordinator.client.delete_http_host("1")

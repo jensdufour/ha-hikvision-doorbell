@@ -19,6 +19,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required("host"): str,
         vol.Required("username", default="admin"): str,
         vol.Required("password"): str,
+        vol.Optional("sdk_port", default=8000): int,
     }
 )
 

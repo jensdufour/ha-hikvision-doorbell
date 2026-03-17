@@ -1,4 +1,4 @@
-"""Coordinator for Hikvision Doorbell with webhook push and polling fallback."""
+"""Coordinator for Hikvision Doorbell with SDK protocol and polling fallback."""
 
 import asyncio
 import base64
@@ -13,12 +13,13 @@ from homeassistant.helpers.update_coordinator import (
 
 from .const import DOMAIN, MQTT_TOPIC_PREFIX, SCAN_INTERVAL_SECONDS
 from .isapi import HikvisionISAPIClient
+from .sdk_protocol import HikvisionSDKReconnector
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
-    """Manages doorbell state with webhook push events and a keepalive poll."""
+    """Manages doorbell state with SDK protocol events and a keepalive poll."""
 
     def __init__(
         self,
@@ -26,6 +27,7 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         client: HikvisionISAPIClient,
         name: str,
         device_info: dict,
+        sdk_port: int = 8000,
     ) -> None:
         super().__init__(
             hass,
@@ -40,6 +42,34 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._sanitized_name = name.lower().replace(" ", "_").replace("-", "_")
         self._ringing = False
         self._ring_clear_task: asyncio.Task | None = None
+        self._sdk_port = sdk_port
+        self._sdk_reconnector: HikvisionSDKReconnector | None = None
+
+    async def start_sdk_listener(self, host: str, username: str, password: str) -> None:
+        """Start the SDK protocol connection for real-time event detection."""
+        self._sdk_reconnector = HikvisionSDKReconnector(
+            host=host,
+            port=self._sdk_port,
+            username=username,
+            password=password,
+            on_ring=self._on_sdk_ring,
+            on_event=self._on_sdk_event,
+        )
+        await self._sdk_reconnector.start()
+
+    async def _on_sdk_ring(self) -> None:
+        """Called by the SDK protocol when a doorbell ring is detected."""
+        _LOGGER.warning(
+            "SDK ring event received for %s!", self.doorbell_name
+        )
+        await self.trigger_ring()
+
+    async def _on_sdk_event(self, cmd1: int, cmd2: int, payload: bytes) -> None:
+        """Called by the SDK protocol for any event (for diagnostics)."""
+        _LOGGER.warning(
+            "SDK event for %s: cmd1=0x%08x cmd2=0x%04x payload_size=%d",
+            self.doorbell_name, cmd1, cmd2, len(payload),
+        )
 
     def handle_alert_stream_event(self, event_xml: str) -> None:
         """Handle an event from the alertStream background thread.
@@ -56,30 +86,7 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         )
 
     async def _async_update_data(self) -> dict:
-        """Fast poll of callStatus to detect button press."""
-        try:
-            call_state, call_raw = await self.client.get_call_status_raw()
-        except Exception as err:
-            call_state = "idle"
-            _LOGGER.debug("Poll error: %s", err)
-
-        # Log every poll so we can see state changes in the logs
-        if call_state != "idle":
-            _LOGGER.warning(
-                "callStatus poll: %s (ringing=%s)",
-                call_state,
-                self._ringing,
-            )
-
-        # If the poll detects a non-idle state, treat it as a ring
-        if call_state != "idle" and not self._ringing:
-            _LOGGER.warning(
-                "Doorbell %s ring detected via polling: %s",
-                self.doorbell_name,
-                call_state,
-            )
-            await self.trigger_ring()
-
+        """Slow keepalive poll. Ring detection is via SDK protocol, not polling."""
         return {"call_state": "ringing" if self._ringing else "idle"}
 
     async def trigger_ring(self) -> None:
@@ -147,3 +154,9 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         await asyncio.sleep(10)
         self._ringing = False
         self.async_set_updated_data({"call_state": "idle"})
+
+    async def stop_sdk(self) -> None:
+        """Stop the SDK protocol connection."""
+        if self._sdk_reconnector:
+            await self._sdk_reconnector.stop()
+            self._sdk_reconnector = None
