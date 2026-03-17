@@ -119,7 +119,7 @@ async def _configure_doorbell_push(
     # First, log current HTTP host config for diagnostics
     try:
         current = await client.get_http_hosts()
-        _LOGGER.warning("Current HTTP host config: %s", current[:500])
+        _LOGGER.warning("Current HTTP host config:\n%s", current)
     except Exception as err:
         _LOGGER.warning("Could not read HTTP host config: %s", err)
 
@@ -128,7 +128,14 @@ async def _configure_doorbell_push(
         result = await client.configure_http_host(
             "1", ha_ip, ha_port, webhook_path
         )
-        _LOGGER.warning("HTTP host configuration result: %s", result[:500])
+        _LOGGER.warning("HTTP host configuration result: %s", result)
+
+        # Read back to verify
+        try:
+            updated = await client.get_http_hosts()
+            _LOGGER.warning("Updated HTTP host config:\n%s", updated)
+        except Exception:
+            pass
     except Exception as err:
         _LOGGER.warning(
             "Could not configure HTTP host notification on doorbell: %s. "

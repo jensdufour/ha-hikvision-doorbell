@@ -354,9 +354,10 @@ class HikvisionISAPIClient:
         Tells the doorbell to POST XML events to http://<ip>:<port><url_path>.
         Returns the response text.
         """
+        ns = "http://www.isapi.org/ver20/XMLSchema"
         xml_body = (
             '<?xml version="1.0" encoding="UTF-8"?>'
-            "<HttpHostNotification>"
+            f'<HttpHostNotification version="2.0" xmlns="{ns}">'
             f"<id>{host_id}</id>"
             f"<url>{url_path}</url>"
             "<protocolType>HTTP</protocolType>"
@@ -368,16 +369,22 @@ class HikvisionISAPIClient:
             "</HttpHostNotification>"
         )
 
-        # Try PUT first (update existing), fall back to POST (create new)
+        _LOGGER.warning("Sending HTTP host config XML: %s", xml_body)
+
+        # Try PUT first (update existing host 1), fall back to POST (create)
         for method in ("PUT", "POST"):
+            path = f"/ISAPI/Event/notification/httpHosts/{host_id}"
+            if method == "POST":
+                path = "/ISAPI/Event/notification/httpHosts"
             try:
-                path = f"/ISAPI/Event/notification/httpHosts/{host_id}"
-                if method == "POST":
-                    path = "/ISAPI/Event/notification/httpHosts"
                 body, _ = await self._async_request_with_body(
                     path, method=method, body=xml_body
                 )
-                return body.decode("utf-8", errors="replace")
+                resp = body.decode("utf-8", errors="replace")
+                _LOGGER.warning(
+                    "HTTP host %s %s response: %s", method, path, resp[:500]
+                )
+                return resp
             except HikvisionISAPIError as err:
                 _LOGGER.debug("HTTP host %s failed: %s", method, err)
                 if method == "POST":
