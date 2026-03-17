@@ -1,20 +1,22 @@
-"""Pure Python Hikvision SDK binary protocol client (v1.3.3).
+"""Pure Python Hikvision SDK binary protocol client (v1.3.4).
 
-Key findings from v1.3.2 logs:
-  - The 32-byte LE header (8 x uint32) is confirmed correct.
-  - A header-only packet (cmd=0, no payload) gets the 127-byte challenge.
-  - ANY packet with cleartext credential bytes gets Connection Reset.
-  - The 28-byte header from v1.3.1 was structurally wrong (7 fields, not 8).
-  - Device has 10 login attempts before lockout; must be conservative.
+Key findings from v1.3.3 logs:
+  - Rapid TCP connections (5 within 100ms) ALL get RST on step1.
+  - The passive loop, connecting 30s later, gets the 127-byte challenge.
+  - After receiving the 127-byte challenge, the device expects the
+    hashed login response IMMEDIATELY. Sending another probe (or anything
+    else) kills the connection.
+  - The device enforces a connection rate limit: too many connections
+    too fast triggers RST for all subsequent attempts.
 
-v1.3.3 strategy:
-  - Single TCP connection for all steps (no per-probe fresh connections).
-  - Step 1: Send 32-byte header-only to get challenge nonce.
-  - Step 2: Send 32-byte header + hashed credentials on SAME connection.
-  - Focus on algo byte 0x06 = SHA-256 variants.
-  - Password truncated to 16 bytes (SDK limit from NET_DVR_LOGIN_PASSWD_MAX_LEN).
-  - Try 5 login flows max (5 connections x 1 attempt each) to preserve attempts.
-  - Log everything for analysis.
+v1.3.4 strategy:
+  - 10-second delay between each login attempt to avoid rate limiting.
+  - On each connection, do the FULL two-step flow:
+      Step 1: Send 32-byte header-only probe -> read 127-byte challenge
+      Step 2: IMMEDIATELY send header + hashed credentials -> read response
+  - One hash variant per connection to avoid confusing the device.
+  - Also test: read-first (no probe) in case device sends challenge on connect.
+  - Max 5 attempts total to preserve retry budget.
 """
 
 import asyncio
@@ -33,18 +35,22 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_SDK_PORT = 8000
 HEADER_SIZE = 32
 
-# From the v1.3.2 challenge response analysis:
-#   Byte 112:  0x0A = 10 remaining attempts
-#   Bytes 116-123: 8-byte challenge salt
-#   Byte 124:  0x06 = hash algorithm indicator
+# Challenge response layout (127 bytes):
+#   [0:4]       preamble/size = 0x7f (127)
+#   [4:8]       status = 0x0407 (challenge issued)
+#   [8:112]     zeros (empty device info, not authenticated)
+#   [112:116]   retry count (LE uint32), e.g. 0x0A = 10
+#   [116:124]   8-byte challenge salt/nonce
+#   [124:127]   algo indicator (byte 124 = 0x06) + 2 zero bytes
 CHALLENGE_SALT_OFFSET = 116
 CHALLENGE_SALT_LEN = 8
 CHALLENGE_ALGO_OFFSET = 124
 CHALLENGE_RETRY_OFFSET = 112
+CHALLENGE_MIN_LEN = 125
 
-# Field sizes in the login payload
-USERNAME_LEN = 32   # matches NAME_LEN in SDK
-PASSWORD_LEN = 16   # NET_DVR_LOGIN_PASSWD_MAX_LEN
+# Login payload field sizes
+USERNAME_LEN = 32
+PASSWORD_LEN = 16  # NET_DVR_LOGIN_PASSWD_MAX_LEN
 
 # Alarm commands
 COMM_ALARM_VIDEO_INTERCOM = 0x1133
@@ -68,33 +74,22 @@ def _build_header(
     extra2: int = 0,
     extra3: int = 0,
 ) -> bytes:
-    """32-byte LE header (8 x uint32).
-
-    Layout:
-      [0:4]   preamble = 0x20
-      [4:8]   status (0 in requests)
-      [8:12]  command
-      [12:16] session ID
-      [16:20] extra1
-      [20:24] payload length
-      [24:28] extra2
-      [28:32] extra3
-    """
+    """32-byte LE header (8 x uint32)."""
     return struct.pack(
         "<8I",
-        HEADER_SIZE,
-        status,
-        cmd,
-        session,
-        extra1,
-        datalen,
-        extra2,
-        extra3,
+        HEADER_SIZE,  # [0:4] preamble = 0x20
+        status,       # [4:8]
+        cmd,          # [8:12]
+        session,      # [12:16]
+        extra1,       # [16:20]
+        datalen,      # [20:24]
+        extra2,       # [24:28]
+        extra3,       # [28:32]
     )
 
 
 def _parse_header(data: bytes) -> dict:
-    """Parse a 32-byte LE response header."""
+    """Parse a response as LE uint32 fields."""
     if len(data) < 4:
         return {"raw_len": len(data)}
     names = ["preamble", "status", "command", "session",
@@ -107,12 +102,6 @@ def _parse_header(data: bytes) -> dict:
     return fields
 
 
-def _hexline(data: bytes, max_bytes: int = 128) -> str:
-    """One-line hex representation."""
-    trunc = data[:max_bytes]
-    return trunc.hex() + ("..." if len(data) > max_bytes else "")
-
-
 def _hexdump(label: str, data: bytes, max_bytes: int = 256) -> None:
     """Log a hex dump."""
     for i in range(0, min(max_bytes, len(data)), 16):
@@ -120,11 +109,6 @@ def _hexdump(label: str, data: bytes, max_bytes: int = 256) -> None:
         hx = " ".join(f"{b:02x}" for b in chunk)
         asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         _LOGGER.warning("SDK [%s] %04x: %-48s  %s", label, i, hx, asc)
-
-
-def _nonzero_map(data: bytes) -> list[tuple[int, int]]:
-    """Return list of (offset, byte_value) for non-zero bytes."""
-    return [(i, b) for i, b in enumerate(data) if b != 0]
 
 
 # ---------------------------------------------------------------------------
@@ -139,103 +123,54 @@ async def _tcp_open(host: str, port: int, timeout: float = 10):
     )
 
 
-async def _tcp_read(reader, timeout: float = 8) -> bytes:
-    """Read all available data from a reader."""
+async def _tcp_read_all(reader, timeout: float = 5) -> bytes:
+    """Read all available data from a reader with timeout."""
     chunks = []
-    read_timeout = timeout
+    t = timeout
     try:
         while True:
-            chunk = await asyncio.wait_for(
-                reader.read(8192), timeout=read_timeout
-            )
+            chunk = await asyncio.wait_for(reader.read(8192), timeout=t)
             if not chunk:
                 break
             chunks.append(chunk)
-            read_timeout = 1.0  # short timeout for subsequent fragments
+            t = 0.5  # short timeout for subsequent fragments
     except asyncio.TimeoutError:
         pass
     return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
-# Hash computation for challenge-response
+# Hash computation
 # ---------------------------------------------------------------------------
 
 
-def _compute_login_hashes(
-    password: str, salt: bytes, algo_byte: int
-) -> list[tuple[str, bytes]]:
-    """Compute candidate hashes for the login challenge.
+def _compute_hash(password: str, salt: bytes, variant: str) -> bytes:
+    """Compute a single hash variant."""
+    pw16 = password.encode("utf-8")[:PASSWORD_LEN]
+    pw_full = password.encode("utf-8")
 
-    The SDK password field is 16 bytes max, so we truncate before hashing.
-    algo_byte 0x06 likely means SHA-256 based.
-
-    Returns list of (name, hash_bytes) to try.
-    """
-    pw = password.encode("utf-8")[:PASSWORD_LEN]
-    pw_full = password.encode("utf-8")  # full password for variants
-
-    variants = []
-
-    # SHA-256 variants (most likely for algo=0x06)
-    variants.append(("sha256_pw16_salt",
-                      hashlib.sha256(pw + salt).digest()))
-    variants.append(("sha256_salt_pw16",
-                      hashlib.sha256(salt + pw).digest()))
-    variants.append(("sha256_sha256pw16_salt",
-                      hashlib.sha256(hashlib.sha256(pw).digest() + salt).digest()))
-    variants.append(("hmac_sha256_salt_pw16",
-                      hmac.new(salt, pw, hashlib.sha256).digest()))
-    variants.append(("hmac_sha256_pw16_salt",
-                      hmac.new(pw.ljust(PASSWORD_LEN, b"\x00"), salt, hashlib.sha256).digest()))
-
-    # SHA-256 with full (non-truncated) password
-    variants.append(("sha256_pwfull_salt",
-                      hashlib.sha256(pw_full + salt).digest()))
-    variants.append(("hmac_sha256_salt_pwfull",
-                      hmac.new(salt, pw_full, hashlib.sha256).digest()))
-
-    # MD5 variants (fallback, in case algo byte interpretation is wrong)
-    variants.append(("md5_pw16_salt",
-                      hashlib.md5(pw + salt).digest()))
-    variants.append(("md5_md5pw16_salt",
-                      hashlib.md5(hashlib.md5(pw).digest() + salt).digest()))
-
-    # HMAC-MD5
-    variants.append(("hmac_md5_salt_pw16",
-                      hmac.new(salt, pw, hashlib.md5).digest()))
-
-    return variants
-
-
-# ---------------------------------------------------------------------------
-# Login flow builder
-# ---------------------------------------------------------------------------
-
-
-def _build_login_payload(
-    username: str, hashed_pw: bytes, payload_style: str
-) -> bytes:
-    """Build the credential payload for the step-2 login packet.
-
-    We try different payload layouts since the exact format is unknown.
-    """
-    user = username.encode("utf-8")[:USERNAME_LEN].ljust(USERNAME_LEN, b"\x00")
-
-    if payload_style == "user32_hash32":
-        # username(32) + hash(32) = 64 bytes
-        return user + hashed_pw[:32].ljust(32, b"\x00")
-
-    elif payload_style == "user32_hash16":
-        # username(32) + hash(16) = 48 bytes
-        return user + hashed_pw[:16].ljust(16, b"\x00")
-
-    elif payload_style == "user32_hash32_pad":
-        # username(32) + hash(32) + padding(32) = 96 bytes
-        return user + hashed_pw[:32].ljust(32, b"\x00") + b"\x00" * 32
-
+    if variant == "sha256_pw16_salt":
+        return hashlib.sha256(pw16 + salt).digest()
+    elif variant == "sha256_salt_pw16":
+        return hashlib.sha256(salt + pw16).digest()
+    elif variant == "sha256_dbl_pw16_salt":
+        return hashlib.sha256(hashlib.sha256(pw16).digest() + salt).digest()
+    elif variant == "hmac_sha256_salt_pw16":
+        return hmac.new(salt, pw16, hashlib.sha256).digest()
+    elif variant == "sha256_pwfull_salt":
+        return hashlib.sha256(pw_full + salt).digest()
+    elif variant == "hmac_sha256_salt_pwfull":
+        return hmac.new(salt, pw_full, hashlib.sha256).digest()
+    elif variant == "md5_pw16_salt":
+        return hashlib.md5(pw16 + salt).digest()
+    elif variant == "md5_dbl_pw16_salt":
+        return hashlib.md5(hashlib.md5(pw16).digest() + salt).digest()
+    elif variant == "hmac_md5_salt_pw16":
+        return hmac.new(salt, pw16, hashlib.md5).digest()
+    elif variant == "md5_pwfull_salt":
+        return hashlib.md5(pw_full + salt).digest()
     else:
-        return user + hashed_pw[:32].ljust(32, b"\x00")
+        return hashlib.sha256(pw16 + salt).digest()
 
 
 # ---------------------------------------------------------------------------
@@ -244,14 +179,16 @@ def _build_login_payload(
 
 
 class HikvisionSDKProtocol:
-    """v1.3.3: Single-connection challenge-response login.
+    """v1.3.4: Rate-limited single-connection challenge-response login.
 
-    Strategy:
-      1. Open one TCP connection
-      2. Send header-only packet -> get 127-byte challenge
-      3. Extract salt and algo byte
-      4. Send header + hashed creds on SAME connection
-      5. Analyse response for session / success
+    Each login attempt:
+      1. Open ONE TCP connection
+      2. Send 32-byte header-only probe
+      3. Read 127-byte challenge (extract salt + algo)
+      4. IMMEDIATELY send 32-byte header + hashed creds on SAME connection
+      5. Read login response
+      6. Close connection
+      7. Wait 10 seconds before next attempt
     """
 
     def __init__(
@@ -273,286 +210,312 @@ class HikvisionSDKProtocol:
         self._listen_task: asyncio.Task | None = None
         self._session_id: int = 0
 
-    async def probe_protocol(self) -> None:
-        """Run login attempts with careful resource management."""
+    # ------------------------------------------------------------------
+    # Login orchestration
+    # ------------------------------------------------------------------
+
+    async def _run_login_attempts(self) -> bool:
+        """Try login with different hash variants, 10s apart.
+
+        Returns True if login succeeded.
+        """
         h, p = self._host, self._port
 
         _LOGGER.warning(
-            "SDK: starting v1.3.3 single-connection login for %s:%d", h, p
+            "SDK: v1.3.4 login sequence for %s:%d (10s between attempts)", h, p
         )
 
-        # Define login flows to try. Each flow = (hash_name, cmd_for_step2,
-        # payload_style). We limit to 5 flows to preserve login attempts.
-        #
-        # The step-1 always uses cmd=0 (header-only, confirmed to work).
-        # For step-2, we try different command values.
-
-        login_flows = [
-            # Flow 1: SHA-256(pw16 + salt), step2 cmd=0x0001, 64-byte payload
-            ("sha256_pw16_salt", 0x0001, "user32_hash32"),
-            # Flow 2: HMAC-SHA256(salt, pw16), step2 cmd=0x0001, 64-byte payload
-            ("hmac_sha256_salt_pw16", 0x0001, "user32_hash32"),
-            # Flow 3: SHA-256(SHA-256(pw16) + salt), step2 cmd=0x0001, 64-byte payload
-            ("sha256_sha256pw16_salt", 0x0001, "user32_hash32"),
-            # Flow 4: SHA-256(pw16 + salt), step2 cmd=0x0400, 64-byte payload
-            ("sha256_pw16_salt", 0x0400, "user32_hash32"),
-            # Flow 5: SHA-256(pw_full + salt), step2 cmd=0x0001, 64-byte payload
-            ("sha256_pwfull_salt", 0x0001, "user32_hash32"),
+        # Each attempt: (label, hash_variant, step2_cmd, payload_format)
+        # payload_format: "u32h32" = username(32) + hash(32) = 64 bytes
+        #                 "u32h16" = username(32) + hash(16) = 48 bytes
+        attempts = [
+            # Attempt 0: Read-first test (no probe) to check if device
+            # sends challenge automatically on connect
+            ("readfirst", None, None, None),
+            # Attempt 1: SHA-256(pw16 + salt), cmd=0x0001
+            ("sha256_pw16", "sha256_pw16_salt", 0x0001, "u32h32"),
+            # Attempt 2: HMAC-SHA256(salt, pw16), cmd=0x0001
+            ("hmac_sha256", "hmac_sha256_salt_pw16", 0x0001, "u32h32"),
+            # Attempt 3: SHA-256(SHA-256(pw16) + salt), cmd=0x0001
+            ("sha256_dbl", "sha256_dbl_pw16_salt", 0x0001, "u32h32"),
+            # Attempt 4: MD5(pw16 + salt), cmd=0x0001
+            ("md5_pw16", "md5_pw16_salt", 0x0001, "u32h32"),
         ]
 
-        for flow_idx, (hash_name, step2_cmd, payload_style) in enumerate(login_flows):
-            _LOGGER.warning(
-                "SDK LOGIN FLOW %d/%d: hash=%s cmd=0x%04x style=%s",
-                flow_idx + 1, len(login_flows), hash_name,
-                step2_cmd, payload_style,
-            )
+        for idx, (label, hash_variant, step2_cmd, fmt) in enumerate(attempts):
+            if not self._running:
+                return False
 
-            result = await self._try_login_flow(
-                hash_name, step2_cmd, payload_style, flow_idx + 1
-            )
+            if idx > 0:
+                _LOGGER.warning("SDK: waiting 10s before attempt %d...", idx)
+                await asyncio.sleep(10)
+
+            if hash_variant is None:
+                # Special: read-first test
+                result = await self._try_read_first(label)
+            else:
+                result = await self._try_login(
+                    label, hash_variant, step2_cmd, fmt, idx
+                )
 
             if result == "success":
-                _LOGGER.warning("SDK: LOGIN SUCCEEDED on flow %d!", flow_idx + 1)
-                return
+                return True
             elif result == "locked":
-                _LOGGER.warning("SDK: device appears locked, stopping attempts")
-                return
-            elif result == "different":
-                _LOGGER.warning(
-                    "SDK: got a DIFFERENT response on flow %d, analyzing...",
-                    flow_idx + 1,
-                )
-                # Continue to see what other flows produce
+                _LOGGER.warning("SDK: device locked, aborting login attempts")
+                return False
 
-        _LOGGER.warning("SDK: all %d login flows exhausted", len(login_flows))
+        _LOGGER.warning("SDK: all login attempts exhausted")
+        return False
 
-    async def _try_login_flow(
-        self,
-        hash_name: str,
-        step2_cmd: int,
-        payload_style: str,
-        flow_num: int,
-    ) -> str:
-        """Execute one complete login flow on a single connection.
+    async def _try_read_first(self, label: str) -> str:
+        """Test if device sends challenge automatically on TCP connect.
 
-        Returns: "success", "failed", "locked", "error", "different"
+        Does NOT send anything - just reads immediately after connecting.
+        This determines whether we need the header-only probe or not.
         """
         h, p = self._host, self._port
         writer = None
-        label = f"flow{flow_num}"
+
+        _LOGGER.warning("SDK [%s]: testing read-first (no probe sent)", label)
 
         try:
             reader, writer = await _tcp_open(h, p, timeout=10)
-            _LOGGER.warning("SDK [%s]: connected to %s:%d", label, h, p)
-        except (OSError, asyncio.TimeoutError) as err:
-            _LOGGER.warning("SDK [%s]: connect failed: %s", label, err)
+            _LOGGER.warning("SDK [%s]: connected, reading without sending...", label)
+
+            # Try to read without sending anything
+            data = await _tcp_read_all(reader, timeout=5)
+
+            if data:
+                _LOGGER.warning(
+                    "SDK [%s]: got %d bytes WITHOUT sending probe: %s",
+                    label, len(data), data.hex(),
+                )
+                _hexdump(f"{label}_auto", data)
+
+                if len(data) >= CHALLENGE_MIN_LEN:
+                    _LOGGER.warning(
+                        "SDK [%s]: DEVICE SENDS CHALLENGE ON CONNECT! "
+                        "No probe needed.",
+                        label,
+                    )
+                    return "auto_challenge"
+            else:
+                _LOGGER.warning(
+                    "SDK [%s]: no data received without probe (need to send probe)",
+                    label,
+                )
+                return "no_auto"
+
+        except (OSError, ConnectionError, asyncio.TimeoutError) as err:
+            _LOGGER.warning("SDK [%s]: error: %s", label, err)
             return "error"
+        finally:
+            if writer:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        return "no_auto"
+
+    async def _try_login(
+        self,
+        label: str,
+        hash_variant: str,
+        step2_cmd: int,
+        payload_fmt: str,
+        attempt_num: int,
+    ) -> str:
+        """Execute one complete login flow on a single TCP connection.
+
+        Step 1: send header-only -> read challenge
+        Step 2: send hashed creds -> read response (on SAME connection)
+
+        Returns: "success", "failed", "locked", "error"
+        """
+        h, p = self._host, self._port
+        writer = None
+
+        _LOGGER.warning(
+            "SDK [%s]: attempt %d - hash=%s cmd=0x%04x",
+            label, attempt_num, hash_variant, step2_cmd,
+        )
 
         try:
-            # --- STEP 1: Header-only probe to get challenge ---
-            step1_hdr = _build_header(cmd=0, datalen=0)
+            reader, writer = await _tcp_open(h, p, timeout=10)
+            _LOGGER.warning("SDK [%s]: connected", label)
+
+            # === STEP 1: Send header-only probe, read challenge ===
+            step1_pkt = _build_header(cmd=0, datalen=0)
             _LOGGER.warning(
-                "SDK [%s] STEP1: TX %d B: %s",
-                label, len(step1_hdr), step1_hdr.hex(),
+                "SDK [%s] S1-TX: %d B: %s",
+                label, len(step1_pkt), step1_pkt.hex(),
             )
-            writer.write(step1_hdr)
+            writer.write(step1_pkt)
             await writer.drain()
 
-            s1_resp = await _tcp_read(reader, timeout=8)
+            s1_data = await _tcp_read_all(reader, timeout=5)
 
-            if not s1_resp:
-                _LOGGER.warning("SDK [%s] STEP1: no response", label)
+            if not s1_data:
+                _LOGGER.warning("SDK [%s] S1: no response", label)
                 return "error"
 
             _LOGGER.warning(
-                "SDK [%s] STEP1: RX %d B: %s",
-                label, len(s1_resp), _hexline(s1_resp),
+                "SDK [%s] S1-RX: %d B: %s",
+                label, len(s1_data), s1_data.hex(),
             )
-            _hexdump(f"{label}_s1", s1_resp)
+            _hexdump(f"{label}_s1", s1_data)
 
-            # Parse the challenge response
-            if len(s1_resp) < 125:
+            if len(s1_data) < CHALLENGE_MIN_LEN:
                 _LOGGER.warning(
-                    "SDK [%s] STEP1: response too short (%d bytes) "
-                    "for challenge extraction",
-                    label, len(s1_resp),
+                    "SDK [%s] S1: too short for challenge (%d < %d)",
+                    label, len(s1_data), CHALLENGE_MIN_LEN,
                 )
                 return "failed"
 
-            # Log all non-zero bytes for analysis
-            nz = _nonzero_map(s1_resp)
-            _LOGGER.warning(
-                "SDK [%s] STEP1: %d non-zero bytes: %s",
-                label, len(nz),
-                [(f"{o}=0x{v:02x}", v) for o, v in nz],
-            )
+            # Parse challenge fields
+            s1_hdr = _parse_header(s1_data)
+            _LOGGER.warning("SDK [%s] S1: header=%s", label, s1_hdr)
 
-            # Extract retry count
-            retries = struct.unpack_from("<I", s1_resp, CHALLENGE_RETRY_OFFSET)[0]
-            _LOGGER.warning("SDK [%s] STEP1: retries remaining = %d", label, retries)
+            retries = struct.unpack_from("<I", s1_data, CHALLENGE_RETRY_OFFSET)[0]
+            salt = s1_data[CHALLENGE_SALT_OFFSET:CHALLENGE_SALT_OFFSET + CHALLENGE_SALT_LEN]
+            algo = s1_data[CHALLENGE_ALGO_OFFSET]
+
+            _LOGGER.warning(
+                "SDK [%s] S1: retries=%d salt=%s algo=0x%02x",
+                label, retries, salt.hex(), algo,
+            )
 
             if retries <= 1:
-                _LOGGER.warning(
-                    "SDK [%s] STEP1: only %d retries left, aborting to "
-                    "avoid lockout",
-                    label, retries,
-                )
+                _LOGGER.warning("SDK [%s]: only %d retries left!", label, retries)
                 return "locked"
 
-            # Extract salt
-            salt = s1_resp[CHALLENGE_SALT_OFFSET:CHALLENGE_SALT_OFFSET + CHALLENGE_SALT_LEN]
-            _LOGGER.warning("SDK [%s] STEP1: salt = %s", label, salt.hex())
-
-            # Extract algo byte
-            algo = s1_resp[CHALLENGE_ALGO_OFFSET]
-            _LOGGER.warning("SDK [%s] STEP1: algo byte = 0x%02x", label, algo)
-
-            # --- Compute the hash for this flow ---
-            all_hashes = _compute_login_hashes(self._password, salt, algo)
-            target_hash = None
-            for name, hval in all_hashes:
-                if name == hash_name:
-                    target_hash = hval
-                    break
-
-            if target_hash is None:
-                _LOGGER.warning("SDK [%s]: hash %s not found", label, hash_name)
-                return "error"
-
+            # === Compute hash ===
+            hashed = _compute_hash(self._password, salt, hash_variant)
             _LOGGER.warning(
-                "SDK [%s] HASH: %s = %s",
-                label, hash_name, target_hash.hex(),
+                "SDK [%s] HASH(%s): %s", label, hash_variant, hashed.hex(),
             )
 
-            # --- STEP 2: Send hashed credentials ---
-            payload = _build_login_payload(
-                self._username, target_hash, payload_style
+            # === STEP 2: Send hashed credentials on SAME connection ===
+            user_bytes = (
+                self._username.encode("utf-8")[:USERNAME_LEN]
+                .ljust(USERNAME_LEN, b"\x00")
             )
-            step2_hdr = _build_header(cmd=step2_cmd, datalen=len(payload))
-            step2_pkt = step2_hdr + payload
+
+            if payload_fmt == "u32h32":
+                payload = user_bytes + hashed[:32].ljust(32, b"\x00")
+            elif payload_fmt == "u32h16":
+                payload = user_bytes + hashed[:16].ljust(16, b"\x00")
+            else:
+                payload = user_bytes + hashed[:32].ljust(32, b"\x00")
+
+            step2_pkt = _build_header(cmd=step2_cmd, datalen=len(payload)) + payload
 
             _LOGGER.warning(
-                "SDK [%s] STEP2: TX %d B (hdr=%d + payload=%d): %s",
-                label, len(step2_pkt), HEADER_SIZE, len(payload),
-                step2_pkt.hex(),
+                "SDK [%s] S2-TX: %d B: %s",
+                label, len(step2_pkt), step2_pkt.hex(),
             )
             writer.write(step2_pkt)
             await writer.drain()
 
-            s2_resp = await _tcp_read(reader, timeout=8)
+            s2_data = await _tcp_read_all(reader, timeout=5)
 
-            if not s2_resp:
-                _LOGGER.warning("SDK [%s] STEP2: no response (connection may be dead)", label)
+            if not s2_data:
+                _LOGGER.warning(
+                    "SDK [%s] S2: no response (connection closed after step2)",
+                    label,
+                )
                 return "failed"
 
             _LOGGER.warning(
-                "SDK [%s] STEP2: RX %d B: %s",
-                label, len(s2_resp), _hexline(s2_resp),
+                "SDK [%s] S2-RX: %d B: %s",
+                label, len(s2_data), s2_data.hex(),
             )
-            _hexdump(f"{label}_s2", s2_resp)
+            _hexdump(f"{label}_s2", s2_data)
 
-            # Parse step2 response header
-            s2_hdr = _parse_header(s2_resp)
-            _LOGGER.warning("SDK [%s] STEP2: header fields: %s", label, s2_hdr)
+            # Parse step2 response
+            s2_hdr = _parse_header(s2_data)
+            _LOGGER.warning("SDK [%s] S2: header=%s", label, s2_hdr)
 
             # Log non-zero bytes
-            nz2 = _nonzero_map(s2_resp)
+            nz = [(i, b) for i, b in enumerate(s2_data) if b != 0]
             _LOGGER.warning(
-                "SDK [%s] STEP2: %d non-zero bytes: %s",
-                label, len(nz2),
-                [(f"{o}=0x{v:02x}", v) for o, v in nz2],
+                "SDK [%s] S2: %d non-zero bytes: %s",
+                label, len(nz),
+                [(f"{o}=0x{v:02x}") for o, v in nz[:30]],
             )
 
-            # Check for generic error
+            # === Analyse step2 response ===
+
+            # Generic error = format rejected
             generic_err = bytes.fromhex("000000100000000d0000000d00000000")
-            if s2_resp[:16] == generic_err:
-                _LOGGER.warning(
-                    "SDK [%s] STEP2: GENERIC ERROR (format rejected)",
-                    label,
-                )
+            if s2_data[:16] == generic_err:
+                _LOGGER.warning("SDK [%s] S2: GENERIC ERROR", label)
                 return "failed"
 
-            # Check if response is same as step1 (another challenge = wrong hash)
-            if s2_resp == s1_resp:
-                _LOGGER.warning(
-                    "SDK [%s] STEP2: same as step1 (re-challenge, "
-                    "hash was wrong)",
-                    label,
-                )
-                return "failed"
-
-            # Check if response has a session (non-zero at offset 12)
-            if len(s2_resp) >= 16:
-                session_candidate = struct.unpack_from("<I", s2_resp, 12)[0]
-                if session_candidate != 0:
-                    _LOGGER.warning(
-                        "SDK [%s] STEP2: SESSION ID = 0x%08x (%d) !!!",
-                        label, session_candidate, session_candidate,
-                    )
-                    self._session_id = session_candidate
-                    return "success"
-
-            # Check status field
-            status = s2_hdr.get("status", 0)
-            if status == 0x0407:
-                _LOGGER.warning(
-                    "SDK [%s] STEP2: status 0x0407 = another challenge "
-                    "(hash was wrong)",
-                    label,
-                )
-                # Extract new retry count
-                if len(s2_resp) > CHALLENGE_RETRY_OFFSET + 4:
+            # Same as step1 = re-challenge (wrong hash, try next)
+            if s2_data == s1_data:
+                _LOGGER.warning("SDK [%s] S2: same as S1 (wrong hash)", label)
+                if len(s2_data) > CHALLENGE_RETRY_OFFSET + 4:
                     new_retries = struct.unpack_from(
-                        "<I", s2_resp, CHALLENGE_RETRY_OFFSET
+                        "<I", s2_data, CHALLENGE_RETRY_OFFSET
                     )[0]
                     _LOGGER.warning(
-                        "SDK [%s] STEP2: new retries = %d", label, new_retries
+                        "SDK [%s] S2: retries now=%d (was %d)",
+                        label, new_retries, retries,
                     )
                 return "failed"
 
-            # Check for zero status (possible success with user_id in another field)
-            if status == 0:
+            # Different from step1 = something happened!
+            if s2_data != s1_data:
                 _LOGGER.warning(
-                    "SDK [%s] STEP2: status=0, checking for user_id...",
-                    label,
+                    "SDK [%s] S2: *** DIFFERENT from S1! *** "
+                    "(s1=%d bytes, s2=%d bytes)",
+                    label, len(s1_data), len(s2_data),
                 )
-                # Scan for potential user_id / session in the response
-                for off in [4, 8, 12, 16, 20]:
-                    if off + 4 <= len(s2_resp):
-                        v = struct.unpack_from("<I", s2_resp, off)[0]
-                        if v != 0:
-                            _LOGGER.warning(
-                                "SDK [%s] STEP2: offset %d = 0x%08x (%d)",
-                                label, off, v, v,
-                            )
 
-            # If we got a different-length response, that's interesting
-            if len(s2_resp) != len(s1_resp):
-                _LOGGER.warning(
-                    "SDK [%s] STEP2: DIFFERENT length! s1=%d s2=%d",
-                    label, len(s1_resp), len(s2_resp),
-                )
-                return "different"
-
-            # Check for any byte difference from step1
-            if s2_resp != s1_resp:
-                _LOGGER.warning("SDK [%s] STEP2: DIFFERENT content from step1!", label)
-                # Show diff positions
-                diffs = []
-                for i in range(min(len(s1_resp), len(s2_resp))):
-                    if s1_resp[i] != s2_resp[i]:
-                        diffs.append(
-                            f"off={i}: s1=0x{s1_resp[i]:02x} s2=0x{s2_resp[i]:02x}"
+                # Show byte-level diff
+                for i in range(min(len(s1_data), len(s2_data))):
+                    if s1_data[i] != s2_data[i]:
+                        _LOGGER.warning(
+                            "SDK [%s] DIFF: off=%d s1=0x%02x s2=0x%02x",
+                            label, i, s1_data[i], s2_data[i],
                         )
+
+                # Check for session ID at offset 12
+                if len(s2_data) >= 16:
+                    sid = struct.unpack_from("<I", s2_data, 12)[0]
+                    if sid != 0:
+                        _LOGGER.warning(
+                            "SDK [%s] S2: SESSION ID = 0x%08x !!!",
+                            label, sid,
+                        )
+                        self._session_id = sid
+                        return "success"
+
+                # Check status
+                status = s2_hdr.get("status", 0)
                 _LOGGER.warning(
-                    "SDK [%s] STEP2: diff positions: %s", label, diffs
+                    "SDK [%s] S2: status=0x%08x", label, status,
                 )
+
+                # Retry count change?
+                if len(s2_data) > CHALLENGE_RETRY_OFFSET + 4:
+                    new_retries = struct.unpack_from(
+                        "<I", s2_data, CHALLENGE_RETRY_OFFSET
+                    )[0]
+                    _LOGGER.warning(
+                        "SDK [%s] S2: retries now=%d (was %d)",
+                        label, new_retries, retries,
+                    )
+
                 return "different"
 
             return "failed"
 
         except (OSError, ConnectionError, asyncio.TimeoutError) as err:
-            _LOGGER.warning("SDK [%s]: connection error: %s", label, err)
+            _LOGGER.warning("SDK [%s]: error: %s", label, err)
             return "error"
         finally:
             if writer:
@@ -563,48 +526,23 @@ class HikvisionSDKProtocol:
                     pass
 
     # ------------------------------------------------------------------
-    # Alarm listener (post-login)
+    # Alarm / passive listeners
     # ------------------------------------------------------------------
 
     def _check_for_alarm(self, data: bytes) -> None:
-        """Check received data for video intercom alarm."""
+        """Check for video intercom alarm in data."""
         for off in range(0, len(data) - 1):
             val16 = struct.unpack_from("<H", data, off)[0]
             if val16 == COMM_ALARM_VIDEO_INTERCOM:
                 _LOGGER.warning(
-                    "SDK: COMM_ALARM_VIDEO_INTERCOM at offset %d!", off
+                    "SDK: COMM_ALARM_VIDEO_INTERCOM at offset %d!", off,
                 )
                 if self._on_ring:
                     asyncio.create_task(self._on_ring())
                 return
 
-    # ------------------------------------------------------------------
-    # Main orchestration
-    # ------------------------------------------------------------------
-
-    async def connect_and_listen(self) -> None:
-        """Run login probes, then maintain keepalive connection."""
-        _LOGGER.warning(
-            "SDK: starting v1.3.3 protocol discovery for %s:%d",
-            self._host, self._port,
-        )
-
-        await self.probe_protocol()
-
-        if self._session_id:
-            _LOGGER.warning(
-                "SDK: logged in with session 0x%08x, starting alarm listener",
-                self._session_id,
-            )
-            await self._alarm_listen_loop()
-        else:
-            _LOGGER.warning(
-                "SDK: login not yet achieved, entering passive listen mode"
-            )
-            await self._passive_listen_loop()
-
     async def _alarm_listen_loop(self) -> None:
-        """Post-login: subscribe to alarms and listen."""
+        """Post-login alarm subscription loop."""
         while self._running:
             writer = None
             try:
@@ -613,8 +551,6 @@ class HikvisionSDKProtocol:
                 )
                 _LOGGER.warning("SDK: alarm listener connected")
 
-                # TODO: send alarm subscription command once login works
-                # For now, just listen for events
                 while self._running:
                     try:
                         data = await asyncio.wait_for(
@@ -624,19 +560,17 @@ class HikvisionSDKProtocol:
                             break
                         _LOGGER.warning(
                             "SDK: alarm RX %d B: %s",
-                            len(data), _hexline(data),
+                            len(data), data[:128].hex(),
                         )
                         self._check_for_alarm(data)
                     except asyncio.TimeoutError:
-                        # Send keepalive
                         try:
                             writer.write(_build_header(cmd=0, datalen=0))
                             await writer.drain()
                         except (OSError, ConnectionError):
                             break
-
             except (OSError, asyncio.TimeoutError) as err:
-                _LOGGER.warning("SDK: alarm connection error: %s", err)
+                _LOGGER.warning("SDK: alarm error: %s", err)
             finally:
                 if writer:
                     try:
@@ -650,41 +584,50 @@ class HikvisionSDKProtocol:
                 await asyncio.sleep(30)
 
     async def _passive_listen_loop(self) -> None:
-        """Pre-login: keep connection open and monitor for events."""
+        """Pre-login: keep connection open, log everything."""
         while self._running:
             writer = None
             try:
                 reader, writer = await _tcp_open(
                     self._host, self._port, timeout=10
                 )
-                _LOGGER.warning("SDK: passive listener connected to %s:%d",
-                                self._host, self._port)
+                _LOGGER.warning(
+                    "SDK: passive listener connected to %s:%d",
+                    self._host, self._port,
+                )
 
-                while self._running:
-                    # Send header-only probe
-                    try:
-                        writer.write(_build_header(cmd=0, datalen=0))
-                        await writer.drain()
-                    except (OSError, ConnectionError):
-                        break
+                # Send one probe to trigger the challenge
+                writer.write(_build_header(cmd=0, datalen=0))
+                await writer.drain()
 
+                # Read the challenge response
+                data = await _tcp_read_all(reader, timeout=5)
+                if data:
+                    _LOGGER.warning(
+                        "SDK: passive RX %d B: %s",
+                        len(data), data.hex(),
+                    )
+                    self._check_for_alarm(data)
+
+                    # After challenge, try to read more data (the device
+                    # may send events without full login on some models)
                     try:
-                        data = await asyncio.wait_for(
-                            reader.read(8192), timeout=60
+                        extra = await asyncio.wait_for(
+                            reader.read(8192), timeout=30
                         )
-                        if not data:
-                            _LOGGER.warning("SDK: passive connection closed")
-                            break
-                        _LOGGER.warning(
-                            "SDK: passive RX %d B: %s",
-                            len(data), _hexline(data),
-                        )
-                        self._check_for_alarm(data)
+                        if extra:
+                            _LOGGER.warning(
+                                "SDK: passive extra RX %d B: %s",
+                                len(extra), extra.hex(),
+                            )
+                            self._check_for_alarm(extra)
                     except asyncio.TimeoutError:
-                        continue
+                        pass
+                else:
+                    _LOGGER.warning("SDK: passive no data")
 
             except (OSError, asyncio.TimeoutError) as err:
-                _LOGGER.warning("SDK: passive connection error: %s", err)
+                _LOGGER.warning("SDK: passive error: %s", err)
             finally:
                 if writer:
                     try:
@@ -694,8 +637,30 @@ class HikvisionSDKProtocol:
                         pass
 
             if self._running:
-                _LOGGER.warning("SDK: reconnecting in 30s ...")
-                await asyncio.sleep(30)
+                _LOGGER.warning("SDK: reconnecting in 60s ...")
+                await asyncio.sleep(60)
+
+    # ------------------------------------------------------------------
+    # Main orchestration
+    # ------------------------------------------------------------------
+
+    async def connect_and_listen(self) -> None:
+        """Run login attempts, then listen loop."""
+        _LOGGER.warning(
+            "SDK: starting v1.3.4 for %s:%d", self._host, self._port,
+        )
+
+        login_ok = await self._run_login_attempts()
+
+        if login_ok:
+            _LOGGER.warning(
+                "SDK: logged in (session=0x%08x), starting alarm listener",
+                self._session_id,
+            )
+            await self._alarm_listen_loop()
+        else:
+            _LOGGER.warning("SDK: login failed, entering passive mode")
+            await self._passive_listen_loop()
 
     # ------------------------------------------------------------------
     # Lifecycle
