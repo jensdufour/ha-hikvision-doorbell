@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
-import socket
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from functools import partial
 from typing import Any
+
+import requests
+from requests.auth import HTTPDigestAuth
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -154,31 +156,38 @@ class HikvisionISAPIClient:
     ) -> None:
         """Listen to the ISAPI alert stream (blocking).
 
-        Uses line-by-line reading (like pyhik) to avoid blocking on
-        partial buffer fills. Scans for <EventNotificationAlert> XML
-        envelopes and passes complete events to the callback.
+        Uses the requests library with stream=True and iter_lines(),
+        the same proven approach used by the pyhik library.
+        Scans for <EventNotificationAlert> XML envelopes and passes
+        complete events to the callback.
         """
-        opener = self._build_opener()
-        response = None
+        session = requests.Session()
+        session.auth = HTTPDigestAuth(self._username, self._password)
+        stream_response = None
 
         # Try each alert stream path
         for path in _ALERT_STREAM_PATHS:
             url = f"{self._base_url}{path}"
             try:
-                response = opener.open(url, timeout=60)
-                _LOGGER.info(
-                    "Alert stream connected: %s (status %s)",
-                    path,
-                    response.status,
+                stream_response = session.get(
+                    url, stream=True, timeout=(10, 60)
                 )
-                break
-            except urllib.error.HTTPError as err:
+                if stream_response.status_code == 200:
+                    _LOGGER.warning(
+                        "Alert stream connected: %s "
+                        "(status=%s, headers=%s)",
+                        path,
+                        stream_response.status_code,
+                        dict(stream_response.headers),
+                    )
+                    break
                 _LOGGER.warning(
                     "Alert stream %s returned HTTP %s, trying next path",
                     path,
-                    err.code,
+                    stream_response.status_code,
                 )
-                continue
+                stream_response.close()
+                stream_response = None
             except Exception as err:
                 _LOGGER.warning(
                     "Alert stream %s failed: %s, trying next path",
@@ -187,38 +196,35 @@ class HikvisionISAPIClient:
                 )
                 continue
 
-        if response is None:
+        if stream_response is None:
             _LOGGER.error(
                 "Could not open alert stream on any path. "
                 "The doorbell may not support ISAPI event streaming."
             )
             return
 
-        # Set a socket-level read timeout (60 seconds between lines)
-        # so readline() doesn't block forever during idle periods.
-        raw_sock = response.fp.raw
-        if hasattr(raw_sock, "_sock"):
-            raw_sock._sock.settimeout(60)
-        elif isinstance(raw_sock, socket.socket):
-            raw_sock.settimeout(60)
-
         # Line-by-line parsing (same approach as pyhik)
         parse_string = ""
         in_event = False
+        line_count = 0
 
-        while not self._alert_stream_stop:
-            try:
-                line_bytes = response.readline()
-                if not line_bytes:
-                    _LOGGER.warning("Alert stream: connection closed by device")
+        try:
+            for line_bytes in stream_response.iter_lines():
+                if self._alert_stream_stop:
                     break
+
+                if not line_bytes:
+                    continue
 
                 line = line_bytes.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
 
-                # Log every non-empty line at debug level for diagnostics
-                _LOGGER.debug("Alert stream line: %s", line[:300])
+                line_count += 1
+                # Log every line at WARNING level for initial diagnostics
+                _LOGGER.warning(
+                    "Alert stream line #%d: %s", line_count, line[:300]
+                )
 
                 # Detect start of an EventNotificationAlert XML envelope
                 if "<EventNotificationAlert" in line:
@@ -228,8 +234,8 @@ class HikvisionISAPIClient:
                 elif "</EventNotificationAlert>" in line:
                     parse_string += " " + line
                     in_event = False
-                    _LOGGER.info(
-                        "Alert stream received complete event: %s",
+                    _LOGGER.warning(
+                        "Alert stream complete event: %s",
                         parse_string[:500],
                     )
                     callback(parse_string)
@@ -238,15 +244,24 @@ class HikvisionISAPIClient:
                 elif in_event:
                     parse_string += " " + line
 
-            except socket.timeout:
-                # No data for 60 seconds, this is normal for idle doorbells
-                _LOGGER.debug("Alert stream: no data for 60s (keepalive)")
-                continue
-            except OSError as err:
-                if self._alert_stream_stop:
-                    break
-                _LOGGER.warning("Alert stream read error: %s", err)
-                break
+        except requests.exceptions.ConnectionError as err:
+            _LOGGER.warning("Alert stream connection lost: %s", err)
+        except requests.exceptions.ReadTimeout:
+            _LOGGER.warning(
+                "Alert stream read timeout (no data for 60s)"
+            )
+        except Exception as err:
+            if not self._alert_stream_stop:
+                _LOGGER.warning("Alert stream error: %s", err)
+        finally:
+            stream_response.close()
+            session.close()
+
+        if line_count == 0:
+            _LOGGER.warning(
+                "Alert stream produced 0 lines before closing. "
+                "The device may not support event streaming."
+            )
 
     async def start_alert_stream(
         self, callback: Callable[[str], None]
