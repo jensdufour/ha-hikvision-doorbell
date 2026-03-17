@@ -41,6 +41,20 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._ringing = False
         self._ring_clear_task: asyncio.Task | None = None
 
+    def handle_alert_stream_event(self, event_xml: str) -> None:
+        """Handle an event from the alertStream background thread.
+
+        This is called from a worker thread, so we schedule onto the loop.
+        """
+        _LOGGER.warning(
+            "alertStream event received for %s: %s",
+            self.doorbell_name,
+            event_xml[:300],
+        )
+        self.hass.loop.call_soon_threadsafe(
+            self.hass.async_create_task, self.trigger_ring()
+        )
+
     async def _async_update_data(self) -> dict:
         """Periodic keepalive poll. Also checks callStatus as fallback."""
         try:

@@ -81,6 +81,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Probe endpoints in background for diagnostics
     hass.async_create_task(client.probe_endpoints())
 
+    # Start alertStream listener as a parallel event detection mechanism
+    client.start_alert_stream(coordinator.handle_alert_stream_event)
+    _LOGGER.warning("Started alertStream listener for doorbell events")
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 

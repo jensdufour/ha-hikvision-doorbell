@@ -1,13 +1,15 @@
 """ISAPI client for Hikvision doorbell devices."""
 
 import asyncio
+import http.client
 import json
 import logging
 import re as _re
+import threading
 import urllib.request
 import xml.etree.ElementTree as ET
 from functools import partial
-from typing import Any
+from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,23 +20,15 @@ _INTERCOM_ENDPOINTS = (
     ("/ISAPI/VideoIntercom/callerInfo?format=json", "callerInfo (JSON)"),
     ("/ISAPI/VideoIntercom/capabilities", "intercom capabilities"),
     ("/ISAPI/Event/notification/httpHosts", "HTTP host notifications"),
-    # Event subscription/trigger endpoints
     ("/ISAPI/Event/triggers", "event triggers root"),
-    ("/ISAPI/Event/triggers/notifications", "event trigger notifications"),
     ("/ISAPI/Event/notification/httpHosts/1/notifications", "host 1 subscriptions"),
-    ("/ISAPI/Event/notification/methods", "notification methods"),
-    ("/ISAPI/Event/schedules", "event schedules"),
-    ("/ISAPI/Event/notification/subscriptions", "event subscriptions"),
-    # Video intercom event endpoints
-    ("/ISAPI/VideoIntercom/phonestatus", "phone status"),
-    ("/ISAPI/VideoIntercom/callSignal?format=json", "callSignal (JSON)"),
-    ("/ISAPI/VideoIntercom/callRecord?format=json", "call records"),
-    # Alarm/security endpoints
-    ("/ISAPI/SecurityCP/AlarmControlByCSV?format=json", "alarm control"),
-    ("/ISAPI/Security/AdminAccesses", "admin accesses"),
-    # Smart event
-    ("/ISAPI/Smart/capabilities", "smart capabilities"),
     ("/ISAPI/System/IO/inputs", "IO inputs"),
+    # Alarm upload config (device claims isSupportAlarmUploadCfg=true)
+    ("/ISAPI/VideoIntercom/alarmUploadCfg", "alarm upload config"),
+    ("/ISAPI/VideoIntercom/workStatus", "work status"),
+    ("/ISAPI/VideoIntercom/operationTime", "operation time"),
+    ("/ISAPI/VideoIntercom/keyCfg", "key config"),
+    ("/ISAPI/VideoIntercom/systemSwitchCfg", "system switch config"),
 )
 
 
@@ -708,3 +702,154 @@ class HikvisionISAPIClient:
 
     async def close(self) -> None:
         """Clean up resources."""
+        self.stop_alert_stream()
+
+    # ------------------------------------------------------------------
+    # alertStream - persistent streaming connection
+    # ------------------------------------------------------------------
+
+    _alert_stream_thread: threading.Thread | None = None
+    _alert_stream_stop: threading.Event | None = None
+
+    def start_alert_stream(
+        self, callback: Callable[[str], None]
+    ) -> None:
+        """Start a background thread that listens to /ISAPI/Event/notification/alertStream.
+
+        The callback receives each XML event chunk as a string and is called
+        from a worker thread -- the caller must schedule coroutines onto the
+        event loop if needed.
+        """
+        self.stop_alert_stream()  # ensure no duplicate
+
+        stop_event = threading.Event()
+        self._alert_stream_stop = stop_event
+
+        def _reader() -> None:
+            """Worker that maintains a persistent HTTP connection."""
+            import base64
+            path = "/ISAPI/Event/notification/alertStream"
+            while not stop_event.is_set():
+                conn: http.client.HTTPConnection | None = None
+                try:
+                    host = self._base_url.replace("http://", "").replace("https://", "")
+                    conn = http.client.HTTPConnection(host, timeout=90)
+
+                    # Build digest auth -- do an initial request to get the challenge
+                    conn.request("GET", path)
+                    resp = conn.getresponse()
+                    _LOGGER.warning(
+                        "alertStream initial response: %s %s headers=%s",
+                        resp.status, resp.reason,
+                        dict(resp.getheaders()),
+                    )
+
+                    if resp.status == 401:
+                        # Need digest auth - use the opener approach
+                        resp.read()  # drain
+                        conn.close()
+                        conn = None
+
+                        # Use urllib opener for auth, but read in streaming mode
+                        opener = self._build_opener()
+                        url = f"{self._base_url}{path}"
+                        stream_resp = opener.open(url, timeout=90)
+                        content_type = stream_resp.headers.get("Content-Type", "")
+                        transfer_enc = stream_resp.headers.get("Transfer-Encoding", "")
+                        content_len = stream_resp.headers.get("Content-Length", "")
+                        _LOGGER.warning(
+                            "alertStream auth response: status=%s Content-Type=%s "
+                            "Transfer-Encoding=%s Content-Length=%s",
+                            stream_resp.status,
+                            content_type,
+                            transfer_enc,
+                            content_len,
+                        )
+
+                        # Check if this is a real stream or a fixed response
+                        if content_len and int(content_len) < 200:
+                            # Small fixed response - not a real stream
+                            body = stream_resp.read()
+                            _LOGGER.warning(
+                                "alertStream small body (%s bytes): %s",
+                                len(body),
+                                body.decode("utf-8", errors="replace"),
+                            )
+                            stream_resp.close()
+                            # Wait before retry
+                            stop_event.wait(30)
+                            continue
+
+                        # Read stream data
+                        _LOGGER.warning("alertStream: starting to read stream...")
+                        buffer = b""
+                        while not stop_event.is_set():
+                            chunk = stream_resp.read(4096)
+                            if not chunk:
+                                _LOGGER.warning("alertStream: stream ended (0 bytes)")
+                                break
+                            buffer += chunk
+                            _LOGGER.warning(
+                                "alertStream chunk (%d bytes): %s",
+                                len(chunk),
+                                chunk.decode("utf-8", errors="replace")[:500],
+                            )
+                            # Try to extract complete XML documents from buffer
+                            text = buffer.decode("utf-8", errors="replace")
+                            # ISAPI alertStream uses multipart boundary or
+                            # sends individual XML docs separated by boundaries
+                            while "</EventNotificationAlert>" in text:
+                                end_idx = text.index("</EventNotificationAlert>") + len("</EventNotificationAlert>")
+                                event_text = text[:end_idx]
+                                text = text[end_idx:]
+                                buffer = text.encode("utf-8")
+                                _LOGGER.warning(
+                                    "alertStream EVENT: %s", event_text[:800]
+                                )
+                                try:
+                                    callback(event_text)
+                                except Exception:
+                                    _LOGGER.warning(
+                                        "alertStream callback error",
+                                        exc_info=True,
+                                    )
+
+                        stream_resp.close()
+                    else:
+                        # No auth needed or different response
+                        body = resp.read()
+                        _LOGGER.warning(
+                            "alertStream non-401 body (%d bytes): %s",
+                            len(body),
+                            body.decode("utf-8", errors="replace")[:500],
+                        )
+
+                except Exception as exc:
+                    if not stop_event.is_set():
+                        _LOGGER.warning(
+                            "alertStream error (will retry in 30s): %s", exc
+                        )
+                finally:
+                    if conn:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                # Wait before reconnecting
+                stop_event.wait(30)
+
+        thread = threading.Thread(
+            target=_reader, name="hikvision-alertstream", daemon=True
+        )
+        thread.start()
+        self._alert_stream_thread = thread
+        _LOGGER.warning("alertStream listener thread started")
+
+    def stop_alert_stream(self) -> None:
+        """Stop the alertStream listener thread."""
+        if self._alert_stream_stop:
+            self._alert_stream_stop.set()
+        if self._alert_stream_thread and self._alert_stream_thread.is_alive():
+            self._alert_stream_thread.join(timeout=5)
+        self._alert_stream_thread = None
+        self._alert_stream_stop = None"
