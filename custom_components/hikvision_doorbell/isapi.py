@@ -457,7 +457,6 @@ class HikvisionISAPIClient:
                 raise
 
         raise HikvisionISAPIError("All HTTP host configuration attempts failed")
-            raise
 
     async def delete_http_host(self, host_id: str) -> None:
         """Remove an HTTP host notification configuration."""
