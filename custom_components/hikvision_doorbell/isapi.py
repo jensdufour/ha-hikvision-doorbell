@@ -4,7 +4,7 @@ import logging
 import xml.etree.ElementTree as ET
 from typing import Any
 
-import httpx
+import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,38 +22,39 @@ class HikvisionISAPIClient:
 
     def __init__(self, host: str, username: str, password: str) -> None:
         self._base_url = f"http://{host}"
-        self._auth = httpx.DigestAuth(username, password)
-        self._client: httpx.AsyncClient | None = None
+        self._username = username
+        self._password = password
+        self._session: aiohttp.ClientSession | None = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """Return a reusable async HTTP client."""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(
-                auth=self._auth,
-                timeout=httpx.Timeout(10.0),
-            )
-        return self._client
+    def _get_auth(self) -> aiohttp.DigestAuth:
+        """Return a DigestAuth instance."""
+        return aiohttp.DigestAuth(self._username, self._password)
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Return a reusable aiohttp session."""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=10)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
 
     async def get_device_info(self) -> dict[str, Any]:
         """Get device information from the ISAPI /System/deviceInfo endpoint."""
-        client = await self._get_client()
+        session = await self._get_session()
+        url = f"{self._base_url}/ISAPI/System/deviceInfo"
         try:
-            response = await client.get(f"{self._base_url}/ISAPI/System/deviceInfo")
-            if response.status_code == 401:
-                raise HikvisionISAPIAuthError("Invalid credentials")
-            response.raise_for_status()
-        except httpx.HTTPStatusError as err:
-            if err.response.status_code == 401:
-                raise HikvisionISAPIAuthError("Invalid credentials") from err
-            raise HikvisionISAPIError(
-                f"Failed to get device info: {err}"
-            ) from err
-        except httpx.HTTPError as err:
+            async with session.get(url, auth=self._get_auth()) as response:
+                if response.status == 401:
+                    raise HikvisionISAPIAuthError("Invalid credentials")
+                response.raise_for_status()
+                text = await response.text()
+        except HikvisionISAPIAuthError:
+            raise
+        except aiohttp.ClientError as err:
             raise HikvisionISAPIError(
                 f"Failed to get device info: {err}"
             ) from err
 
-        root = ET.fromstring(response.text)
+        root = ET.fromstring(text)
 
         def _find_text(tag: str) -> str | None:
             """Find text content of a tag, trying various namespace approaches."""
@@ -81,21 +82,23 @@ class HikvisionISAPIClient:
 
         Returns a status string such as 'idle', 'ringing', 'dismissed'.
         """
-        client = await self._get_client()
+        session = await self._get_session()
+        url = f"{self._base_url}/ISAPI/VideoIntercom/callStatus"
         try:
-            response = await client.get(
-                f"{self._base_url}/ISAPI/VideoIntercom/callStatus",
-                params={"format": "json"},
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as err:
+            async with session.get(
+                url, auth=self._get_auth(), params={"format": "json"}
+            ) as response:
+                response.raise_for_status()
+                text = await response.text()
+        except aiohttp.ClientError as err:
             raise HikvisionISAPIError(
                 f"Failed to get call status: {err}"
             ) from err
 
         # Try JSON first, fall back to XML
         try:
-            data = response.json()
+            import json
+            data = json.loads(text)
             status = data.get("CallStatus", {}).get("status")
             if status:
                 return status
@@ -104,7 +107,7 @@ class HikvisionISAPIClient:
 
         # Try XML parsing as fallback
         try:
-            root = ET.fromstring(response.text)
+            root = ET.fromstring(text)
             for prefix in (
                 "{http://www.hikvision.com/ver20/XMLSchema}",
                 "{*}",
@@ -123,17 +126,16 @@ class HikvisionISAPIClient:
 
         Tries channel 101 (main stream) first, then falls back to channel 1.
         """
-        client = await self._get_client()
+        session = await self._get_session()
         for channel in ("101", "1"):
+            url = f"{self._base_url}/ISAPI/Streaming/channels/{channel}/picture"
             try:
-                response = await client.get(
-                    f"{self._base_url}/ISAPI/Streaming/channels/{channel}/picture",
-                )
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "")
-                if content_type.startswith("image/"):
-                    return response.content
-            except httpx.HTTPError:
+                async with session.get(url, auth=self._get_auth()) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "")
+                    if content_type.startswith("image/"):
+                        return await response.read()
+            except aiohttp.ClientError:
                 _LOGGER.debug(
                     "Snapshot channel %s unavailable, trying next", channel
                 )
@@ -142,7 +144,7 @@ class HikvisionISAPIClient:
         return None
 
     async def close(self) -> None:
-        """Close the HTTP client."""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        """Close the HTTP session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
