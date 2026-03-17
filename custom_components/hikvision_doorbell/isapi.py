@@ -715,9 +715,9 @@ class HikvisionISAPIClient:
         PUT it back. This makes the doorbell report button presses to
         the HTTP host (center).
         """
-        path = "/ISAPI/VideoIntercom/keyCfg"
+        list_path = "/ISAPI/VideoIntercom/keyCfg"
         try:
-            body, _ = await self._async_request(path)
+            body, _ = await self._async_request(list_path)
             raw = body.decode("utf-8", errors="replace")
         except HikvisionISAPIError as err:
             _LOGGER.warning("keyCfg GET error: %s", err)
@@ -725,31 +725,68 @@ class HikvisionISAPIClient:
 
         self._log_xml_lines("KEYCFG_BEFORE", raw)
 
-        # Replace enableCallCenter false -> true
-        if "<enableCallCenter>false</enableCallCenter>" in raw:
-            modified = raw.replace(
+        if "<enableCallCenter>true</enableCallCenter>" in raw:
+            _LOGGER.warning("keyCfg: enableCallCenter already true")
+            return "already enabled"
+
+        if "<enableCallCenter>false</enableCallCenter>" not in raw:
+            _LOGGER.warning("keyCfg: enableCallCenter field not found")
+            return "field not found"
+
+        modified_list = raw.replace(
+            "<enableCallCenter>false</enableCallCenter>",
+            "<enableCallCenter>true</enableCallCenter>",
+        )
+        _LOGGER.warning("keyCfg: setting enableCallCenter to true")
+
+        # Strategy 1: PUT to list endpoint
+        try:
+            resp_body, _ = await self._async_request_with_body(
+                list_path, method="PUT", body=modified_list
+            )
+            resp = resp_body.decode("utf-8", errors="replace")
+            _LOGGER.warning("keyCfg list PUT response: %s", resp)
+            return resp
+        except HikvisionISAPIError as err:
+            _LOGGER.warning("keyCfg list PUT failed: %s -- trying individual", err)
+
+        # Strategy 2: Extract inner <KeyCfg> and PUT to /keyCfg/1
+        match = _re.search(
+            r"(<KeyCfg[^L][^>]*>.*?</KeyCfg>)", raw, _re.DOTALL
+        )
+        if match:
+            inner = match.group(1)
+            inner = inner.replace(
                 "<enableCallCenter>false</enableCallCenter>",
                 "<enableCallCenter>true</enableCallCenter>",
             )
-            _LOGGER.warning("keyCfg: setting enableCallCenter to true")
-            self._log_xml_lines("KEYCFG_PUT_BODY", modified)
-
+            single_body = f'<?xml version="1.0" encoding="UTF-8"?>\n{inner}'
+            self._log_xml_lines("KEYCFG_SINGLE_PUT", single_body)
             try:
                 resp_body, _ = await self._async_request_with_body(
-                    path, method="PUT", body=modified
+                    "/ISAPI/VideoIntercom/keyCfg/1",
+                    method="PUT",
+                    body=single_body,
                 )
                 resp = resp_body.decode("utf-8", errors="replace")
-                _LOGGER.warning("keyCfg PUT response: %s", resp)
+                _LOGGER.warning("keyCfg/1 PUT response: %s", resp)
                 return resp
             except HikvisionISAPIError as err:
-                _LOGGER.warning("keyCfg PUT failed: %s", err)
-                return f"PUT failed: {err}"
-        elif "<enableCallCenter>true</enableCallCenter>" in raw:
-            _LOGGER.warning("keyCfg: enableCallCenter already true")
-            return "already enabled"
-        else:
-            _LOGGER.warning("keyCfg: enableCallCenter field not found")
-            return "field not found"
+                _LOGGER.warning("keyCfg/1 PUT failed: %s", err)
+
+        # Strategy 3: Try POST instead of PUT
+        for path in (list_path, "/ISAPI/VideoIntercom/keyCfg/1"):
+            try:
+                resp_body, _ = await self._async_request_with_body(
+                    path, method="POST", body=modified_list,
+                )
+                resp = resp_body.decode("utf-8", errors="replace")
+                _LOGGER.warning("keyCfg POST %s response: %s", path, resp)
+                return resp
+            except HikvisionISAPIError as err:
+                _LOGGER.warning("keyCfg POST %s failed: %s", path, err)
+
+        return "all keyCfg update attempts failed"
 
     # ------------------------------------------------------------------
     # alertStream - persistent streaming connection
