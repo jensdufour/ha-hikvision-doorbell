@@ -148,6 +148,13 @@ async def _configure_doorbell_push(
             err,
         )
 
+    # Enable call center on doorbell keys so button presses report to HTTP host
+    try:
+        result = await client.enable_call_center_on_keys()
+        _LOGGER.warning("Enable call center on keys result: %s", result)
+    except Exception as err:
+        _LOGGER.warning("Could not enable call center on keys: %s", err)
+
     # Enable event subscriptions so the doorbell actually pushes events
     try:
         result = await client.enable_center_notifications()

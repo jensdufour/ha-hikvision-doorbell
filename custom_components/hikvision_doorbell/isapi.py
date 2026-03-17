@@ -705,6 +705,53 @@ class HikvisionISAPIClient:
         self.stop_alert_stream()
 
     # ------------------------------------------------------------------
+    # Key config - enable call center reporting
+    # ------------------------------------------------------------------
+
+    async def enable_call_center_on_keys(self) -> str:
+        """Enable enableCallCenter on all key configs.
+
+        GET /ISAPI/VideoIntercom/keyCfg, set enableCallCenter to true,
+        PUT it back. This makes the doorbell report button presses to
+        the HTTP host (center).
+        """
+        path = "/ISAPI/VideoIntercom/keyCfg"
+        try:
+            body, _ = await self._async_request(path)
+            raw = body.decode("utf-8", errors="replace")
+        except HikvisionISAPIError as err:
+            _LOGGER.warning("keyCfg GET error: %s", err)
+            return f"error: {err}"
+
+        self._log_xml_lines("KEYCFG_BEFORE", raw)
+
+        # Replace enableCallCenter false -> true
+        if "<enableCallCenter>false</enableCallCenter>" in raw:
+            modified = raw.replace(
+                "<enableCallCenter>false</enableCallCenter>",
+                "<enableCallCenter>true</enableCallCenter>",
+            )
+            _LOGGER.warning("keyCfg: setting enableCallCenter to true")
+            self._log_xml_lines("KEYCFG_PUT_BODY", modified)
+
+            try:
+                resp_body, _ = await self._async_request_with_body(
+                    path, method="PUT", body=modified
+                )
+                resp = resp_body.decode("utf-8", errors="replace")
+                _LOGGER.warning("keyCfg PUT response: %s", resp)
+                return resp
+            except HikvisionISAPIError as err:
+                _LOGGER.warning("keyCfg PUT failed: %s", err)
+                return f"PUT failed: {err}"
+        elif "<enableCallCenter>true</enableCallCenter>" in raw:
+            _LOGGER.warning("keyCfg: enableCallCenter already true")
+            return "already enabled"
+        else:
+            _LOGGER.warning("keyCfg: enableCallCenter field not found")
+            return "field not found"
+
+    # ------------------------------------------------------------------
     # alertStream - persistent streaming connection
     # ------------------------------------------------------------------
 
