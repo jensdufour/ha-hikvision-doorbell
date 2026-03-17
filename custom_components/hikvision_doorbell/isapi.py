@@ -357,46 +357,78 @@ class HikvisionISAPIClient:
     ) -> str:
         """Configure an HTTP host for event push notifications.
 
-        Tells the doorbell to POST XML events to http://<ip>:<port><url_path>.
-        Returns the response text.
+        Strategy: GET the current config, modify only the fields we need,
+        and PUT it back. This avoids XML format mismatches.
         """
-        ns = "http://www.isapi.org/ver20/XMLSchema"
-        # Format XML exactly as the device returns it (with newlines)
-        xml_body = (
-            '<?xml version="1.0" encoding="UTF-8"?>\r\n'
-            f'<HttpHostNotification version="2.0" xmlns="{ns}">\r\n'
-            f"<id>{host_id}</id>\r\n"
-            f"<url>{url_path}</url>\r\n"
-            "<protocolType>HTTP</protocolType>\r\n"
-            "<parameterFormatType>XML</parameterFormatType>\r\n"
-            "<addressingFormatType>ipaddress</addressingFormatType>\r\n"
-            f"<ipAddress>{ip}</ipAddress>\r\n"
-            f"<portNo>{port}</portNo>\r\n"
-            "<httpAuthenticationMethod>none</httpAuthenticationMethod>\r\n"
-            "</HttpHostNotification>\r\n"
+        # Step 1: GET the current configuration
+        try:
+            body, _ = await self._async_request(
+                f"/ISAPI/Event/notification/httpHosts/{host_id}"
+            )
+            current_xml = body.decode("utf-8", errors="replace")
+        except HikvisionISAPIError:
+            # Single-host GET failed, try getting the list
+            try:
+                body, _ = await self._async_request(
+                    "/ISAPI/Event/notification/httpHosts"
+                )
+                current_xml = body.decode("utf-8", errors="replace")
+            except HikvisionISAPIError as err:
+                return f"error getting config: {err}"
+
+        _LOGGER.warning("Current HTTP host XML to modify:\n%s", current_xml)
+
+        # Step 2: Extract the single HttpHostNotification element
+        # If we got the list, extract just the notification for our host_id
+        import re
+
+        # Find the HttpHostNotification block
+        match = re.search(
+            r"(<HttpHostNotification[^>]*>.*?</HttpHostNotification>)",
+            current_xml,
+            re.DOTALL,
+        )
+        if not match:
+            _LOGGER.warning("Could not find HttpHostNotification in response")
+            return "error: no HttpHostNotification found"
+
+        notif_xml = match.group(1)
+
+        # Step 3: Replace the field values using regex
+        notif_xml = re.sub(
+            r"<url>[^<]*</url>",
+            f"<url>{url_path}</url>",
+            notif_xml,
+        )
+        notif_xml = re.sub(
+            r"<ipAddress>[^<]*</ipAddress>",
+            f"<ipAddress>{ip}</ipAddress>",
+            notif_xml,
+        )
+        notif_xml = re.sub(
+            r"<portNo>[^<]*</portNo>",
+            f"<portNo>{port}</portNo>",
+            notif_xml,
         )
 
-        _LOGGER.warning("Sending HTTP host config XML:\n%s", xml_body)
+        # Build the full XML with declaration
+        xml_body = f'<?xml version="1.0" encoding="UTF-8"?>\n{notif_xml}'
 
-        # Try PUT first (update existing host 1), fall back to POST (create)
-        for method in ("PUT", "POST"):
-            path = f"/ISAPI/Event/notification/httpHosts/{host_id}"
-            if method == "POST":
-                path = "/ISAPI/Event/notification/httpHosts"
-            try:
-                body, _ = await self._async_request_with_body(
-                    path, method=method, body=xml_body
-                )
-                resp = body.decode("utf-8", errors="replace")
-                _LOGGER.warning(
-                    "HTTP host %s %s response: %s", method, path, resp[:500]
-                )
-                return resp
-            except HikvisionISAPIError as err:
-                _LOGGER.warning("HTTP host %s %s failed: %s", method, path, err)
-                if method == "POST":
-                    raise
-        return "failed"
+        _LOGGER.warning("Sending modified HTTP host config XML:\n%s", xml_body)
+
+        # Step 4: PUT it back
+        try:
+            resp_body, _ = await self._async_request_with_body(
+                f"/ISAPI/Event/notification/httpHosts/{host_id}",
+                method="PUT",
+                body=xml_body,
+            )
+            resp = resp_body.decode("utf-8", errors="replace")
+            _LOGGER.warning("HTTP host PUT response: %s", resp)
+            return resp
+        except HikvisionISAPIError as err:
+            _LOGGER.warning("HTTP host PUT failed: %s", err)
+            raise
 
     async def delete_http_host(self, host_id: str) -> None:
         """Remove an HTTP host notification configuration."""
