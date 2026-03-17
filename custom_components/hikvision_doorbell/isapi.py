@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re as _re
 import urllib.request
 import xml.etree.ElementTree as ET
 from functools import partial
@@ -477,6 +478,223 @@ class HikvisionISAPIClient:
             )
         except HikvisionISAPIError:
             _LOGGER.debug("Could not delete HTTP host %s", host_id, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Event trigger subscription
+    # ------------------------------------------------------------------
+
+    async def get_event_triggers_raw(self) -> str:
+        """Return the full XML of /ISAPI/Event/triggers."""
+        try:
+            body, _ = await self._async_request("/ISAPI/Event/triggers")
+            return body.decode("utf-8", errors="replace")
+        except HikvisionISAPIError as err:
+            return f"error: {err}"
+
+    async def get_host_notifications_raw(self, host_id: str = "1") -> str:
+        """Return the full XML from /ISAPI/Event/notification/httpHosts/<id>/notifications."""
+        path = f"/ISAPI/Event/notification/httpHosts/{host_id}/notifications"
+        try:
+            body, _ = await self._async_request(path)
+            return body.decode("utf-8", errors="replace")
+        except HikvisionISAPIError as err:
+            return f"error: {err}"
+
+    async def enable_center_notifications(self) -> str:
+        """Enable 'center' (HTTP host) notification on every event trigger.
+
+        Strategy:
+          1. GET /ISAPI/Event/triggers to obtain the full trigger list.
+          2. For each <EventTrigger> that does NOT already have a
+             <notificationMethod>center</notificationMethod> entry,
+             inject one into its notification list.
+          3. PUT the modified XML back.
+
+        Returns a human-readable result string.
+        """
+        # Step 1 -- fetch triggers
+        triggers_xml = await self.get_event_triggers_raw()
+        _LOGGER.warning("EVENT TRIGGERS full XML:\n%s", triggers_xml)
+
+        if triggers_xml.startswith("error:"):
+            return triggers_xml
+
+        # Step 2 -- inject center notification using regex
+        # Typical structure:
+        #   <EventTriggerNotificationList>
+        #     <EventTriggerNotification>
+        #       <notificationMethod>...</notificationMethod>
+        #     </EventTriggerNotification>
+        #   </EventTriggerNotificationList>
+
+        # Check if center is already present
+        if "<notificationMethod>center</notificationMethod>" in triggers_xml:
+            _LOGGER.warning("center notification already present in triggers")
+            # Even so, still PUT to make sure the device persists it
+        else:
+            _LOGGER.warning("center notification NOT present -- injecting")
+
+        # We need to ensure every <EventTriggerNotificationList> contains a
+        # center entry.  Instead of fragile regex surgery on each block, use
+        # ElementTree for reliable manipulation.
+        try:
+            root = ET.fromstring(triggers_xml)
+        except ET.ParseError as exc:
+            return f"XML parse error: {exc}"
+
+        ns_map: dict[str, str] = {}
+        # Detect default namespace from root tag
+        m = _re.match(r"\{(.+?)\}", root.tag)
+        ns = m.group(1) if m else ""
+        if ns:
+            ns_map[""] = ns
+            ET.register_namespace("", ns)
+
+        def _tag(name: str) -> str:
+            return f"{{{ns}}}{name}" if ns else name
+
+        modified = False
+        for trigger in root.iter(_tag("EventTrigger")):
+            notif_list = trigger.find(_tag("EventTriggerNotificationList"))
+            if notif_list is None:
+                # Create the list element
+                notif_list = ET.SubElement(trigger, _tag("EventTriggerNotificationList"))
+
+            # Check if center already exists
+            has_center = False
+            max_id = 0
+            for notif in notif_list.findall(_tag("EventTriggerNotification")):
+                nid = notif.find(_tag("id"))
+                if nid is not None and nid.text:
+                    try:
+                        max_id = max(max_id, int(nid.text))
+                    except ValueError:
+                        pass
+                method_el = notif.find(_tag("notificationMethod"))
+                if method_el is not None and method_el.text == "center":
+                    has_center = True
+
+            if not has_center:
+                new_notif = ET.SubElement(
+                    notif_list, _tag("EventTriggerNotification")
+                )
+                id_el = ET.SubElement(new_notif, _tag("id"))
+                id_el.text = str(max_id + 1)
+                method_el = ET.SubElement(new_notif, _tag("notificationMethod"))
+                method_el.text = "center"
+                recur_el = ET.SubElement(
+                    new_notif, _tag("notificationRecurrence")
+                )
+                recur_el.text = "beginning"
+                modified = True
+                etype_el = trigger.find(_tag("eventType"))
+                etype = etype_el.text if etype_el is not None else "?"
+                _LOGGER.warning(
+                    "Injected center notification for trigger eventType=%s",
+                    etype,
+                )
+
+        if not modified:
+            _LOGGER.warning("All triggers already have center notification")
+
+        # Step 3 -- PUT back
+        new_xml = ET.tostring(root, encoding="unicode", xml_declaration=True)
+        _LOGGER.warning("PUTting modified triggers XML:\n%s", new_xml[:2000])
+
+        try:
+            resp_body, _ = await self._async_request_with_body(
+                "/ISAPI/Event/triggers", method="PUT", body=new_xml
+            )
+            resp = resp_body.decode("utf-8", errors="replace")
+            _LOGGER.warning("Event triggers PUT response: %s", resp)
+            return resp
+        except HikvisionISAPIError as err:
+            _LOGGER.warning("Event triggers PUT failed: %s", err)
+            # Fallback: try PUTting to individual trigger endpoints
+            return await self._enable_center_individual_triggers(root, ns)
+
+    async def _enable_center_individual_triggers(
+        self, root: ET.Element, ns: str
+    ) -> str:
+        """Fallback: PUT each trigger individually."""
+
+        def _tag(name: str) -> str:
+            return f"{{{ns}}}{name}" if ns else name
+
+        results: list[str] = []
+        for trigger in root.iter(_tag("EventTrigger")):
+            tid_el = trigger.find(_tag("id"))
+            tid = tid_el.text if tid_el is not None else None
+            if not tid:
+                continue
+            trigger_xml = ET.tostring(
+                trigger, encoding="unicode", xml_declaration=True
+            )
+            path = f"/ISAPI/Event/triggers/{tid}"
+            try:
+                resp_body, _ = await self._async_request_with_body(
+                    path, method="PUT", body=trigger_xml
+                )
+                resp = resp_body.decode("utf-8", errors="replace")
+                results.append(f"trigger {tid}: OK")
+                _LOGGER.warning(
+                    "Individual trigger PUT %s response: %s", path, resp
+                )
+            except HikvisionISAPIError as err:
+                results.append(f"trigger {tid}: {err}")
+                _LOGGER.warning("Individual trigger PUT %s failed: %s", path, err)
+        return "; ".join(results) if results else "no triggers found"
+
+    async def enable_host_notification_subscriptions(
+        self, host_id: str = "1"
+    ) -> str:
+        """Try to enable all event subscriptions on the HTTP host.
+
+        GET the host's notification list, log it, and if not already
+        configured, try PUTting an 'all events' subscription.
+        """
+        path = f"/ISAPI/Event/notification/httpHosts/{host_id}/notifications"
+        raw = await self.get_host_notifications_raw(host_id)
+        _LOGGER.warning("HOST %s NOTIFICATIONS full XML:\n%s", host_id, raw)
+
+        if raw.startswith("error:"):
+            return raw
+
+        # Try to parse and see what's there
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            return f"cannot parse host notifications XML"
+
+        m = _re.match(r"\{(.+?)\}", root.tag)
+        ns = m.group(1) if m else ""
+        if ns:
+            ET.register_namespace("", ns)
+
+        def _tag(name: str) -> str:
+            return f"{{{ns}}}{name}" if ns else name
+
+        # Log all current notification entries
+        for notif in root.iter(_tag("EventNotificationAlert")):
+            etype = notif.find(_tag("eventType"))
+            _LOGGER.warning(
+                "Host %s subscribed event: %s",
+                host_id,
+                etype.text if etype is not None else "unknown",
+            )
+
+        # Try PUTting the XML back as-is to confirm it's writable
+        put_xml = ET.tostring(root, encoding="unicode", xml_declaration=True)
+        try:
+            resp_body, _ = await self._async_request_with_body(
+                path, method="PUT", body=put_xml
+            )
+            resp = resp_body.decode("utf-8", errors="replace")
+            _LOGGER.warning("Host notifications PUT response: %s", resp)
+            return resp
+        except HikvisionISAPIError as err:
+            _LOGGER.warning("Host notifications PUT failed: %s", err)
+            return f"PUT failed: {err}"
 
     async def close(self) -> None:
         """Clean up resources."""

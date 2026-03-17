@@ -144,6 +144,19 @@ async def _configure_doorbell_push(
             err,
         )
 
+    # Enable event subscriptions so the doorbell actually pushes events
+    try:
+        result = await client.enable_center_notifications()
+        _LOGGER.warning("Enable center notifications result: %s", result)
+    except Exception as err:
+        _LOGGER.warning("Could not enable center notifications: %s", err)
+
+    try:
+        result = await client.enable_host_notification_subscriptions("1")
+        _LOGGER.warning("Host notification subscriptions result: %s", result)
+    except Exception as err:
+        _LOGGER.warning("Could not configure host subscriptions: %s", err)
+
 
 async def _handle_webhook(
     hass: HomeAssistant, webhook_id: str, request: web.Request
