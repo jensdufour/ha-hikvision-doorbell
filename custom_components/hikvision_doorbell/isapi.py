@@ -21,6 +21,7 @@ _INTERCOM_ENDPOINTS = (
     ("/ISAPI/VideoIntercom/capabilities", "intercom capabilities"),
     ("/ISAPI/Event/triggers/notifications", "event triggers"),
     ("/ISAPI/Event/channels", "event channels"),
+    ("/ISAPI/Event/notification/httpHosts", "HTTP host notifications"),
     ("/ISAPI/System/IO/inputs", "IO inputs"),
     ("/ISAPI/System/IO/inputs/1/status", "IO input 1 status"),
 )
@@ -85,6 +86,66 @@ class HikvisionISAPIClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, partial(self._sync_request, path, timeout)
+        )
+
+    def _sync_request_with_body(
+        self,
+        path: str,
+        method: str = "PUT",
+        body: str = "",
+        content_type: str = "application/xml",
+        timeout: int = 10,
+    ) -> tuple[bytes, dict]:
+        """Make a synchronous HTTP request with a body and auth."""
+        url = f"{self._base_url}{path}"
+        data = body.encode("utf-8") if body else None
+        opener = self._build_opener()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={"Content-Type": content_type},
+        )
+        try:
+            response = opener.open(req, timeout=timeout)
+            resp_body = response.read()
+            headers = dict(response.headers)
+            return resp_body, headers
+        except urllib.error.HTTPError as err:
+            if err.code == 401:
+                raise HikvisionISAPIAuthError("Invalid credentials") from err
+            raise HikvisionISAPIError(
+                f"HTTP {err.code} {method} {path}"
+            ) from err
+        except urllib.error.URLError as err:
+            raise HikvisionISAPIError(
+                f"Cannot connect to {self._base_url}: {err.reason}"
+            ) from err
+        except OSError as err:
+            raise HikvisionISAPIError(
+                f"Connection error: {err}"
+            ) from err
+
+    async def _async_request_with_body(
+        self,
+        path: str,
+        method: str = "PUT",
+        body: str = "",
+        content_type: str = "application/xml",
+        timeout: int = 10,
+    ) -> tuple[bytes, dict]:
+        """Run a request with body in the executor."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            partial(
+                self._sync_request_with_body,
+                path,
+                method,
+                body,
+                content_type,
+                timeout,
+            ),
         )
 
     async def get_device_info(self) -> dict[str, Any]:
@@ -264,6 +325,9 @@ class HikvisionISAPIClient:
                 content_type = headers.get("Content-Type", "")
                 if content_type.startswith("image/"):
                     return body
+                # Some firmware returns JPEG without proper Content-Type
+                if body[:3] == b"\xff\xd8\xff":
+                    return body
             except HikvisionISAPIError:
                 _LOGGER.debug(
                     "Snapshot channel %s unavailable, trying next", channel
@@ -271,6 +335,64 @@ class HikvisionISAPIClient:
                 continue
         _LOGGER.warning("Failed to capture snapshot from any channel")
         return None
+
+    async def get_http_hosts(self) -> str:
+        """Get the current HTTP host notification configuration."""
+        try:
+            body, _ = await self._async_request(
+                "/ISAPI/Event/notification/httpHosts"
+            )
+            return body.decode("utf-8", errors="replace")
+        except HikvisionISAPIError as err:
+            return f"error: {err}"
+
+    async def configure_http_host(
+        self, host_id: str, ip: str, port: int, url_path: str
+    ) -> str:
+        """Configure an HTTP host for event push notifications.
+
+        Tells the doorbell to POST XML events to http://<ip>:<port><url_path>.
+        Returns the response text.
+        """
+        xml_body = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<HttpHostNotification>"
+            f"<id>{host_id}</id>"
+            f"<url>{url_path}</url>"
+            "<protocolType>HTTP</protocolType>"
+            "<parameterFormatType>XML</parameterFormatType>"
+            "<addressingFormatType>ipaddress</addressingFormatType>"
+            f"<ipAddress>{ip}</ipAddress>"
+            f"<portNo>{port}</portNo>"
+            "<httpAuthenticationMethod>none</httpAuthenticationMethod>"
+            "</HttpHostNotification>"
+        )
+
+        # Try PUT first (update existing), fall back to POST (create new)
+        for method in ("PUT", "POST"):
+            try:
+                path = f"/ISAPI/Event/notification/httpHosts/{host_id}"
+                if method == "POST":
+                    path = "/ISAPI/Event/notification/httpHosts"
+                body, _ = await self._async_request_with_body(
+                    path, method=method, body=xml_body
+                )
+                return body.decode("utf-8", errors="replace")
+            except HikvisionISAPIError as err:
+                _LOGGER.debug("HTTP host %s failed: %s", method, err)
+                if method == "POST":
+                    raise
+        return "failed"
+
+    async def delete_http_host(self, host_id: str) -> None:
+        """Remove an HTTP host notification configuration."""
+        try:
+            await self._async_request_with_body(
+                f"/ISAPI/Event/notification/httpHosts/{host_id}",
+                method="DELETE",
+            )
+        except HikvisionISAPIError:
+            _LOGGER.debug("Could not delete HTTP host %s", host_id, exc_info=True)
 
     async def close(self) -> None:
         """Clean up resources."""
