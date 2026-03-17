@@ -57,8 +57,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Start the ISAPI alert stream for real-time ring detection
-    await coordinator.start_alert_stream()
+    # Probe the device to discover which ISAPI endpoints are available.
+    # This runs once at startup and logs results at WARNING level.
+    hass.async_create_task(client.probe_endpoints())
 
     return True
 

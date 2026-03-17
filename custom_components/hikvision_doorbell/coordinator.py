@@ -1,9 +1,8 @@
-"""Coordinator for Hikvision Doorbell using ISAPI alertStream."""
+"""Coordinator for Hikvision Doorbell using ISAPI polling."""
 
 import asyncio
 import base64
 import logging
-import xml.etree.ElementTree as ET
 from datetime import timedelta
 
 from homeassistant.components import mqtt
@@ -17,23 +16,9 @@ from .isapi import HikvisionISAPIClient
 
 _LOGGER = logging.getLogger(__name__)
 
-# Event types from the ISAPI alertStream that indicate a doorbell ring.
-# These are matched case-insensitively against the <eventType> XML value.
-_RING_EVENT_TYPES = {
-    "videointercom",
-    "callstatus",
-    "doorbell",
-    "videointercomevent",
-    "videointercomalarm",
-}
-
 
 class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
-    """Manages the Hikvision doorbell alert stream and ring events.
-
-    Uses ISAPI alertStream for real-time push events instead of polling.
-    Falls back to callStatus polling if the alertStream is not available.
-    """
+    """Polls the Hikvision doorbell call status and handles ring events."""
 
     def __init__(
         self,
@@ -53,131 +38,63 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self.device_info_data = device_info
         self.latest_snapshot: bytes | None = None
         self._sanitized_name = name.lower().replace(" ", "_").replace("-", "_")
+        self._previous_state: str | None = None
         self._ringing = False
         self._ring_clear_task: asyncio.Task | None = None
-        self._stream_started = False
+        self._poll_count = 0
 
-    async def start_alert_stream(self) -> None:
-        """Start listening to the ISAPI alert stream."""
-        if self._stream_started:
-            return
-        self._stream_started = True
+    async def _async_update_data(self) -> dict:
+        """Poll call status and detect state transitions."""
+        self._poll_count += 1
 
-        def _on_alert_event(raw_event: str) -> None:
-            """Called from the executor thread when an alert event arrives."""
-            event_type = self._extract_event_type(raw_event)
-            _LOGGER.info(
-                "Alert stream event received - eventType=%s, raw length=%d",
-                event_type or "unknown",
-                len(raw_event),
+        try:
+            current_state, raw_response = await self.client.get_call_status_raw()
+        except Exception as err:
+            _LOGGER.debug("Error polling call status: %s", err)
+            return self.data or {"call_state": "idle"}
+
+        # Log the full raw response at WARNING level for the first 20 polls,
+        # and then whenever the state changes. This is critical for diagnostics.
+        if self._poll_count <= 20 or current_state != self._previous_state:
+            _LOGGER.warning(
+                "Poll #%d: call_state=%s, raw=%s",
+                self._poll_count,
+                current_state,
+                raw_response[:300],
             )
 
-            if self._is_ring_event(event_type, raw_event):
-                _LOGGER.info(
-                    "Ring event detected (eventType=%s)!", event_type
+        # Detect ringing state
+        if current_state != "idle" and self._previous_state == "idle":
+            _LOGGER.warning(
+                "Doorbell %s state changed: %s -> %s",
+                self.doorbell_name,
+                self._previous_state,
+                current_state,
+            )
+            if not self._ringing:
+                self._ringing = True
+                await self._handle_ring()
+                if self._ring_clear_task and not self._ring_clear_task.done():
+                    self._ring_clear_task.cancel()
+                self._ring_clear_task = self.hass.async_create_task(
+                    self._clear_ringing()
                 )
-                self.hass.loop.call_soon_threadsafe(
-                    self.hass.async_create_task,
-                    self._handle_ring_from_stream(),
-                )
-            else:
-                _LOGGER.info(
-                    "Non-ring event from stream: eventType=%s, data=%s",
-                    event_type,
-                    raw_event[:300],
-                )
 
-        await self.client.start_alert_stream(_on_alert_event)
-        _LOGGER.info(
-            "Started ISAPI alert stream for %s", self.doorbell_name
-        )
-
-    @staticmethod
-    def _extract_event_type(raw_event: str) -> str | None:
-        """Extract the eventType from the raw event XML."""
-        try:
-            xml_start = raw_event.find("<EventNotificationAlert")
-            if xml_start < 0:
-                xml_start = raw_event.find("<?xml")
-            if xml_start >= 0:
-                xml_text = raw_event[xml_start:]
-                root = ET.fromstring(xml_text)
-                for elem in root.iter():
-                    tag = (
-                        elem.tag.split("}")[-1]
-                        if "}" in elem.tag
-                        else elem.tag
-                    )
-                    if tag.lower() == "eventtype" and elem.text:
-                        return elem.text.strip()
-        except ET.ParseError:
-            _LOGGER.debug("Could not parse event XML: %s", raw_event[:200])
-        return None
-
-    @staticmethod
-    def _is_ring_event(event_type: str | None, raw_event: str) -> bool:
-        """Determine if the event indicates a doorbell ring."""
-        if event_type:
-            if event_type.lower() in _RING_EVENT_TYPES:
-                return True
-        # Fallback: check raw text for ring indicators
-        lower = raw_event.lower()
-        return any(
-            kw in lower
-            for kw in ("ringing", "doorbell_ringing", "callincoming", "callstatus")
-        )
-
-    async def _handle_ring_from_stream(self) -> None:
-        """Handle a ring event from the alert stream."""
-        _LOGGER.info("Doorbell %s is ringing! (from alert stream)", self.doorbell_name)
-        self._ringing = True
-        self.data = {"call_state": "ringing"}
-        self.async_update_listeners()
-
-        await self._handle_ring()
-
-        # Clear ringing state after 10 seconds
-        if self._ring_clear_task and not self._ring_clear_task.done():
-            self._ring_clear_task.cancel()
-        self._ring_clear_task = self.hass.async_create_task(
-            self._clear_ringing()
-        )
+        self._previous_state = current_state
+        return {"call_state": "ringing" if self._ringing else current_state}
 
     async def _clear_ringing(self) -> None:
         """Clear the ringing state after a delay."""
         await asyncio.sleep(10)
         self._ringing = False
-        self.data = {"call_state": "idle"}
-        self.async_update_listeners()
-
-    async def _async_update_data(self) -> dict:
-        """Periodic poll as fallback / keepalive.
-
-        If the alert stream is running, this just confirms connectivity.
-        If the alert stream is not running, it polls callStatus.
-        """
-        if self._ringing:
-            return {"call_state": "ringing"}
-
-        try:
-            current_state = await self.client.get_call_status()
-        except Exception:
-            return self.data or {"call_state": "idle"}
-
-        if current_state == "ringing" and not self._ringing:
-            _LOGGER.info("Doorbell %s is ringing! (from poll)", self.doorbell_name)
-            self._ringing = True
-            await self._handle_ring()
-            if self._ring_clear_task and not self._ring_clear_task.done():
-                self._ring_clear_task.cancel()
-            self._ring_clear_task = self.hass.async_create_task(
-                self._clear_ringing()
-            )
-
-        return {"call_state": current_state if current_state == "ringing" else "idle"}
+        self.async_set_updated_data({"call_state": "idle"})
 
     async def _handle_ring(self) -> None:
         """Handle a doorbell ring: capture snapshot and publish to MQTT."""
+        _LOGGER.warning(
+            "Doorbell %s is RINGING! Capturing snapshot and publishing MQTT.",
+            self.doorbell_name,
+        )
         # Capture snapshot
         try:
             snapshot = await self.client.get_snapshot()

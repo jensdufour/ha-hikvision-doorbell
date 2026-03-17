@@ -5,19 +5,23 @@ import json
 import logging
 import urllib.request
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
 from functools import partial
 from typing import Any
 
-import requests
-from requests.auth import HTTPDigestAuth
-
 _LOGGER = logging.getLogger(__name__)
 
-# Alert stream URL paths to try (primary first, fallback for older firmware)
-_ALERT_STREAM_PATHS = (
-    "/ISAPI/Event/notification/alertStream",
-    "/Event/notification/alertStream",
+# ISAPI endpoints to probe for call/ring detection.
+# Each tuple is (path, description).
+_INTERCOM_ENDPOINTS = (
+    ("/ISAPI/VideoIntercom/callStatus", "callStatus"),
+    ("/ISAPI/VideoIntercom/callStatus?format=json", "callStatus (JSON)"),
+    ("/ISAPI/VideoIntercom/callerInfo", "callerInfo"),
+    ("/ISAPI/VideoIntercom/callSignal", "callSignal"),
+    ("/ISAPI/VideoIntercom/operationStatus", "operationStatus"),
+    ("/ISAPI/VideoIntercom/capabilities", "intercom capabilities"),
+    ("/ISAPI/Event/triggers/notifications", "event triggers"),
+    ("/ISAPI/Event/channels", "event channels"),
+    ("/ISAPI/System/IO/inputs", "IO inputs"),
 )
 
 
@@ -40,8 +44,6 @@ class HikvisionISAPIClient:
         self._base_url = f"http://{host}"
         self._username = username
         self._password = password
-        self._alert_stream_task: asyncio.Task | None = None
-        self._alert_stream_stop = False
 
     def _build_opener(self) -> urllib.request.OpenerDirector:
         """Build a urllib opener with Digest + Basic auth support."""
@@ -112,17 +114,17 @@ class HikvisionISAPIClient:
             "mac": _find_text("macAddress"),
         }
 
-    async def get_call_status(self) -> str:
-        """Get the current video intercom call status.
+    async def get_call_status_raw(self) -> tuple[str, str]:
+        """Get the raw call status response for diagnostics.
 
-        Returns a status string such as 'idle', 'ringing', 'dismissed'.
+        Returns (status_string, raw_response_text).
         """
         try:
             body, _ = await self._async_request(
                 "/ISAPI/VideoIntercom/callStatus?format=json"
             )
-        except HikvisionISAPIError:
-            return "idle"
+        except HikvisionISAPIError as err:
+            return "idle", f"error: {err}"
 
         text = body.decode("utf-8", errors="replace")
 
@@ -131,7 +133,7 @@ class HikvisionISAPIClient:
             data = json.loads(text)
             status = data.get("CallStatus", {}).get("status")
             if status:
-                return status
+                return status, text
         except Exception:
             pass
 
@@ -145,153 +147,36 @@ class HikvisionISAPIClient:
             ):
                 elem = root.find(f"{prefix}status")
                 if elem is not None and elem.text:
-                    return elem.text.strip()
+                    return elem.text.strip(), text
         except ET.ParseError:
             pass
 
-        return "idle"
+        return "idle", text
 
-    def _sync_listen_alert_stream(
-        self, callback: Callable[[str], None]
-    ) -> None:
-        """Listen to the ISAPI alert stream (blocking).
+    async def get_call_status(self) -> str:
+        """Get the current video intercom call status."""
+        status, _ = await self.get_call_status_raw()
+        return status
 
-        Uses the requests library with stream=True and iter_lines(),
-        the same proven approach used by the pyhik library.
-        Scans for <EventNotificationAlert> XML envelopes and passes
-        complete events to the callback.
+    async def probe_endpoints(self) -> dict[str, str]:
+        """Probe all known ISAPI intercom endpoints and log their responses.
+
+        Returns a dict of {endpoint_name: response_text_or_error}.
+        Used for diagnostics to discover what the device supports.
         """
-        session = requests.Session()
-        session.auth = HTTPDigestAuth(self._username, self._password)
-        stream_response = None
-
-        # Try each alert stream path
-        for path in _ALERT_STREAM_PATHS:
-            url = f"{self._base_url}{path}"
+        results: dict[str, str] = {}
+        for path, name in _INTERCOM_ENDPOINTS:
             try:
-                stream_response = session.get(
-                    url, stream=True, timeout=(10, 60)
-                )
-                if stream_response.status_code == 200:
-                    _LOGGER.warning(
-                        "Alert stream connected: %s "
-                        "(status=%s, headers=%s)",
-                        path,
-                        stream_response.status_code,
-                        dict(stream_response.headers),
-                    )
-                    break
+                body, headers = await self._async_request(path, timeout=5)
+                text = body.decode("utf-8", errors="replace")
+                results[name] = text[:500]
                 _LOGGER.warning(
-                    "Alert stream %s returned HTTP %s, trying next path",
-                    path,
-                    stream_response.status_code,
+                    "PROBE %s [%s]: %s", name, path, text[:300]
                 )
-                stream_response.close()
-                stream_response = None
-            except Exception as err:
-                _LOGGER.warning(
-                    "Alert stream %s failed: %s, trying next path",
-                    path,
-                    err,
-                )
-                continue
-
-        if stream_response is None:
-            _LOGGER.error(
-                "Could not open alert stream on any path. "
-                "The doorbell may not support ISAPI event streaming."
-            )
-            return
-
-        # Line-by-line parsing (same approach as pyhik)
-        parse_string = ""
-        in_event = False
-        line_count = 0
-
-        try:
-            for line_bytes in stream_response.iter_lines():
-                if self._alert_stream_stop:
-                    break
-
-                if not line_bytes:
-                    continue
-
-                line = line_bytes.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-
-                line_count += 1
-                # Log every line at WARNING level for initial diagnostics
-                _LOGGER.warning(
-                    "Alert stream line #%d: %s", line_count, line[:300]
-                )
-
-                # Detect start of an EventNotificationAlert XML envelope
-                if "<EventNotificationAlert" in line:
-                    in_event = True
-                    parse_string = line
-
-                elif "</EventNotificationAlert>" in line:
-                    parse_string += " " + line
-                    in_event = False
-                    _LOGGER.warning(
-                        "Alert stream complete event: %s",
-                        parse_string[:500],
-                    )
-                    callback(parse_string)
-                    parse_string = ""
-
-                elif in_event:
-                    parse_string += " " + line
-
-        except requests.exceptions.ConnectionError as err:
-            _LOGGER.warning("Alert stream connection lost: %s", err)
-        except requests.exceptions.ReadTimeout:
-            _LOGGER.warning(
-                "Alert stream read timeout (no data for 60s)"
-            )
-        except Exception as err:
-            if not self._alert_stream_stop:
-                _LOGGER.warning("Alert stream error: %s", err)
-        finally:
-            stream_response.close()
-            session.close()
-
-        if line_count == 0:
-            _LOGGER.warning(
-                "Alert stream produced 0 lines before closing. "
-                "The device may not support event streaming."
-            )
-
-    async def start_alert_stream(
-        self, callback: Callable[[str], None]
-    ) -> None:
-        """Start listening to the ISAPI alert stream in a background task."""
-        self._alert_stream_stop = False
-
-        async def _run_stream() -> None:
-            retry_delay = 5
-            while not self._alert_stream_stop:
-                loop = asyncio.get_running_loop()
-                try:
-                    await loop.run_in_executor(
-                        None,
-                        partial(self._sync_listen_alert_stream, callback),
-                    )
-                except Exception:
-                    _LOGGER.warning(
-                        "Alert stream error, reconnecting in %ds",
-                        retry_delay,
-                        exc_info=True,
-                    )
-                if not self._alert_stream_stop:
-                    _LOGGER.info(
-                        "Alert stream disconnected, reconnecting in %ds",
-                        retry_delay,
-                    )
-                    await asyncio.sleep(retry_delay)
-
-        self._alert_stream_task = asyncio.create_task(_run_stream())
+            except HikvisionISAPIError as err:
+                results[name] = f"error: {err}"
+                _LOGGER.warning("PROBE %s [%s]: %s", name, path, err)
+        return results
 
     async def get_snapshot(self) -> bytes | None:
         """Capture a JPEG snapshot from the doorbell camera.
@@ -315,8 +200,4 @@ class HikvisionISAPIClient:
         return None
 
     async def close(self) -> None:
-        """Stop the alert stream."""
-        self._alert_stream_stop = True
-        if self._alert_stream_task and not self._alert_stream_task.done():
-            self._alert_stream_task.cancel()
-            self._alert_stream_task = None
+        """Clean up resources."""
