@@ -5,6 +5,7 @@ import json
 import logging
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from functools import partial
 from typing import Any
 
@@ -30,6 +31,8 @@ class HikvisionISAPIClient:
         self._base_url = f"http://{host}"
         self._username = username
         self._password = password
+        self._alert_stream_task: asyncio.Task | None = None
+        self._alert_stream_stop = False
 
     def _build_opener(self) -> urllib.request.OpenerDirector:
         """Build a urllib opener with Digest + Basic auth support."""
@@ -105,9 +108,13 @@ class HikvisionISAPIClient:
 
         Returns a status string such as 'idle', 'ringing', 'dismissed'.
         """
-        body, _ = await self._async_request(
-            "/ISAPI/VideoIntercom/callStatus?format=json"
-        )
+        try:
+            body, _ = await self._async_request(
+                "/ISAPI/VideoIntercom/callStatus?format=json"
+            )
+        except HikvisionISAPIError:
+            return "idle"
+
         text = body.decode("utf-8", errors="replace")
 
         # Try JSON first, fall back to XML
@@ -117,7 +124,7 @@ class HikvisionISAPIClient:
             if status:
                 return status
         except Exception:
-            _LOGGER.debug("Call status response is not JSON, trying XML")
+            pass
 
         # Try XML parsing as fallback
         try:
@@ -131,9 +138,91 @@ class HikvisionISAPIClient:
                 if elem is not None and elem.text:
                     return elem.text.strip()
         except ET.ParseError:
-            _LOGGER.debug("Call status response is not valid XML either")
+            pass
 
         return "idle"
+
+    def _sync_listen_alert_stream(
+        self, callback: Callable[[str], None]
+    ) -> None:
+        """Listen to the ISAPI alert stream (blocking). Calls callback with event XML."""
+        url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
+        opener = self._build_opener()
+        try:
+            response = opener.open(url, timeout=300)
+        except Exception as err:
+            _LOGGER.warning("Failed to open alert stream: %s", err)
+            return
+
+        buffer = b""
+        boundary = None
+
+        while not self._alert_stream_stop:
+            try:
+                chunk = response.read(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+
+                # Detect the multipart boundary from the first chunk
+                if boundary is None:
+                    content_type = response.headers.get("Content-Type", "")
+                    if "boundary=" in content_type:
+                        boundary = (
+                            "--"
+                            + content_type.split("boundary=")[1].split(";")[0].strip()
+                        ).encode()
+                    else:
+                        # Try to detect from buffer
+                        for line in buffer.split(b"\r\n"):
+                            if line.startswith(b"--"):
+                                boundary = line.strip()
+                                break
+                    if boundary is None:
+                        # Not multipart, treat entire buffer as event data
+                        text = buffer.decode("utf-8", errors="replace")
+                        if "<eventType>" in text:
+                            callback(text)
+                            buffer = b""
+                        continue
+
+                # Split on boundary and process complete parts
+                parts = buffer.split(boundary)
+                # Keep the last part (may be incomplete)
+                buffer = parts[-1]
+
+                for part in parts[:-1]:
+                    text = part.decode("utf-8", errors="replace")
+                    if "<eventType>" in text or '"eventType"' in text:
+                        callback(text)
+            except OSError:
+                if self._alert_stream_stop:
+                    break
+                _LOGGER.debug("Alert stream read error, reconnecting")
+                break
+
+    async def start_alert_stream(
+        self, callback: Callable[[str], None]
+    ) -> None:
+        """Start listening to the ISAPI alert stream in a background task."""
+        self._alert_stream_stop = False
+
+        async def _run_stream() -> None:
+            while not self._alert_stream_stop:
+                loop = asyncio.get_running_loop()
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        partial(self._sync_listen_alert_stream, callback),
+                    )
+                except Exception:
+                    _LOGGER.warning(
+                        "Alert stream error, reconnecting in 5s", exc_info=True
+                    )
+                if not self._alert_stream_stop:
+                    await asyncio.sleep(5)
+
+        self._alert_stream_task = asyncio.create_task(_run_stream())
 
     async def get_snapshot(self) -> bytes | None:
         """Capture a JPEG snapshot from the doorbell camera.
@@ -157,4 +246,8 @@ class HikvisionISAPIClient:
         return None
 
     async def close(self) -> None:
-        """No persistent connection to close with urllib."""
+        """Stop the alert stream."""
+        self._alert_stream_stop = True
+        if self._alert_stream_task and not self._alert_stream_task.done():
+            self._alert_stream_task.cancel()
+            self._alert_stream_task = None
