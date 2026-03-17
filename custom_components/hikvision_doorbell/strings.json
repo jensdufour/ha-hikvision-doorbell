@@ -8,8 +8,7 @@
                     "name": "Name",
                     "host": "Host (IP address)",
                     "username": "Username",
-                    "password": "Password",
-                    "sdk_port": "SDK Port (default 8000)"
+                    "password": "Password"
                 }
             }
         },

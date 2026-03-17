@@ -4,7 +4,7 @@ HACS integration for Home Assistant that connects to Hikvision DS-KV series door
 
 ## Features
 
-- Detects doorbell button presses by polling the ISAPI call status endpoint
+- Detects doorbell button presses by polling the ISAPI call status endpoint every 2 seconds
 - Captures a snapshot from the doorbell camera on each ring
 - Publishes ring events and snapshots to MQTT for use in automations
 - Exposes a binary sensor (ringing state) and image entity (latest snapshot) in Home Assistant
@@ -27,6 +27,14 @@ The config flow asks for:
 | Host     | IP address of the doorbell         |          |
 | Username | ISAPI username                     | admin    |
 | Password | ISAPI password                     |          |
+
+## How it works
+
+The integration polls `GET /ISAPI/VideoIntercom/callStatus?format=json` every 2 seconds.
+When the doorbell button is pressed, the response changes from `"idle"` to `"ring"`.
+The integration then captures a snapshot and publishes the event to MQTT.
+
+This approach was confirmed working on the **DS-KV6113-WPE1(B)** in standalone mode by [Ryan Fitton](https://github.com/ryanfitton/rpi-pico-hikvision-isapi-doorbell-chime).
 
 ## MQTT Topics
 
