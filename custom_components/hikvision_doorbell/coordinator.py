@@ -56,12 +56,20 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         )
 
     async def _async_update_data(self) -> dict:
-        """Periodic keepalive poll. Also checks callStatus as fallback."""
+        """Fast poll of callStatus to detect button press."""
         try:
             call_state, call_raw = await self.client.get_call_status_raw()
         except Exception as err:
             call_state = "idle"
-            _LOGGER.debug("Keepalive poll error: %s", err)
+            _LOGGER.debug("Poll error: %s", err)
+
+        # Log every poll so we can see state changes in the logs
+        if call_state != "idle":
+            _LOGGER.warning(
+                "callStatus poll: %s (ringing=%s)",
+                call_state,
+                self._ringing,
+            )
 
         # If the poll detects a non-idle state, treat it as a ring
         if call_state != "idle" and not self._ringing:
