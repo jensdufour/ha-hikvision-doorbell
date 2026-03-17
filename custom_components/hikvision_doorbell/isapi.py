@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from functools import partial
@@ -99,30 +100,30 @@ class HikvisionISAPIClient:
             "mac": _find_text("macAddress"),
         }
 
-    async def get_call_status(self) -> str:
+    async def get_call_status(self) -> tuple[str, str]:
         """Get the current video intercom call status.
 
         Polls /ISAPI/VideoIntercom/callStatus?format=json which returns
         "idle", "ring", or "onCall".
-        """
-        try:
-            body, _ = await self._async_request(
-                "/ISAPI/VideoIntercom/callStatus?format=json"
-            )
-        except HikvisionISAPIError:
-            return "idle"
 
+        Returns (status, raw_response_text).
+        Raises HikvisionISAPIError on connection/auth failure.
+        """
+        body, _ = await self._async_request(
+            "/ISAPI/VideoIntercom/callStatus?format=json"
+        )
         text = body.decode("utf-8", errors="replace")
 
         try:
             data = json.loads(text)
             status = data.get("CallStatus", {}).get("status")
             if status:
-                return status
+                return status, text
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
 
-        return "idle"
+        # Could not parse status from response
+        return "unknown", text
 
     async def get_snapshot(self) -> bytes | None:
         """Capture a JPEG snapshot from the doorbell camera.
