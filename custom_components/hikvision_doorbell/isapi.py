@@ -112,10 +112,16 @@ class HikvisionISAPIClient:
             headers = dict(response.headers)
             return resp_body, headers
         except urllib.error.HTTPError as err:
+            # Read the error response body for diagnostics
+            err_body = ""
+            try:
+                err_body = err.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
             if err.code == 401:
                 raise HikvisionISAPIAuthError("Invalid credentials") from err
             raise HikvisionISAPIError(
-                f"HTTP {err.code} {method} {path}"
+                f"HTTP {err.code} {method} {path}: {err_body[:500]}"
             ) from err
         except urllib.error.URLError as err:
             raise HikvisionISAPIError(
@@ -386,7 +392,7 @@ class HikvisionISAPIClient:
                 )
                 return resp
             except HikvisionISAPIError as err:
-                _LOGGER.debug("HTTP host %s failed: %s", method, err)
+                _LOGGER.warning("HTTP host %s %s failed: %s", method, path, err)
                 if method == "POST":
                     raise
         return "failed"
