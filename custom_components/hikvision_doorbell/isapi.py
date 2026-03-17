@@ -852,4 +852,4 @@ class HikvisionISAPIClient:
         if self._alert_stream_thread and self._alert_stream_thread.is_alive():
             self._alert_stream_thread.join(timeout=5)
         self._alert_stream_thread = None
-        self._alert_stream_stop = None"
+        self._alert_stream_stop = None
