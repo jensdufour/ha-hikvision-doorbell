@@ -19,7 +19,7 @@ from .isapi import HikvisionISAPIClient, HikvisionISAPIError
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["binary_sensor", "image"]
-_VERSION = "1.3.2"
+_VERSION = "1.3.3"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
