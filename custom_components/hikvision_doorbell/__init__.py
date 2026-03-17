@@ -4,10 +4,11 @@ import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
 from .coordinator import HikvisionDoorbellCoordinator
-from .isapi import HikvisionISAPIClient
+from .isapi import HikvisionISAPIClient, HikvisionISAPIError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -22,7 +23,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         password=entry.data["password"],
     )
 
-    device_info = await client.get_device_info()
+    try:
+        device_info = await client.get_device_info()
+    except HikvisionISAPIError as err:
+        await client.close()
+        raise ConfigEntryNotReady(
+            f"Cannot connect to doorbell: {err}"
+        ) from err
+    except Exception as err:
+        await client.close()
+        raise ConfigEntryNotReady(
+            f"Unexpected error connecting to doorbell: {err}"
+        ) from err
 
     coordinator = HikvisionDoorbellCoordinator(
         hass=hass,
