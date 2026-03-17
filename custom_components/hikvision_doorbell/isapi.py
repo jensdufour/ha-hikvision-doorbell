@@ -13,17 +13,27 @@ _LOGGER = logging.getLogger(__name__)
 # ISAPI endpoints to probe for call/ring detection.
 # Each tuple is (path, description).
 _INTERCOM_ENDPOINTS = (
-    ("/ISAPI/VideoIntercom/callStatus", "callStatus"),
     ("/ISAPI/VideoIntercom/callStatus?format=json", "callStatus (JSON)"),
-    ("/ISAPI/VideoIntercom/callerInfo", "callerInfo"),
-    ("/ISAPI/VideoIntercom/callSignal", "callSignal"),
-    ("/ISAPI/VideoIntercom/operationStatus", "operationStatus"),
+    ("/ISAPI/VideoIntercom/callerInfo?format=json", "callerInfo (JSON)"),
     ("/ISAPI/VideoIntercom/capabilities", "intercom capabilities"),
-    ("/ISAPI/Event/triggers/notifications", "event triggers"),
-    ("/ISAPI/Event/channels", "event channels"),
     ("/ISAPI/Event/notification/httpHosts", "HTTP host notifications"),
+    # Event subscription/trigger endpoints
+    ("/ISAPI/Event/triggers", "event triggers root"),
+    ("/ISAPI/Event/triggers/notifications", "event trigger notifications"),
+    ("/ISAPI/Event/notification/httpHosts/1/notifications", "host 1 subscriptions"),
+    ("/ISAPI/Event/notification/methods", "notification methods"),
+    ("/ISAPI/Event/schedules", "event schedules"),
+    ("/ISAPI/Event/notification/subscriptions", "event subscriptions"),
+    # Video intercom event endpoints
+    ("/ISAPI/VideoIntercom/phonestatus", "phone status"),
+    ("/ISAPI/VideoIntercom/callSignal?format=json", "callSignal (JSON)"),
+    ("/ISAPI/VideoIntercom/callRecord?format=json", "call records"),
+    # Alarm/security endpoints
+    ("/ISAPI/SecurityCP/AlarmControlByCSV?format=json", "alarm control"),
+    ("/ISAPI/Security/AdminAccesses", "admin accesses"),
+    # Smart event
+    ("/ISAPI/Smart/capabilities", "smart capabilities"),
     ("/ISAPI/System/IO/inputs", "IO inputs"),
-    ("/ISAPI/System/IO/inputs/1/status", "IO input 1 status"),
 )
 
 
@@ -309,9 +319,9 @@ class HikvisionISAPIClient:
             try:
                 body, headers = await self._async_request(path, timeout=5)
                 text = body.decode("utf-8", errors="replace")
-                results[name] = text[:500]
+                results[name] = text[:1000]
                 _LOGGER.warning(
-                    "PROBE %s [%s]: %s", name, path, text[:300]
+                    "PROBE %s [%s]: %s", name, path, text[:800]
                 )
             except HikvisionISAPIError as err:
                 results[name] = f"error: {err}"
