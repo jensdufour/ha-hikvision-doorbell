@@ -3,12 +3,11 @@
 import asyncio
 import base64
 import logging
-import re
 import xml.etree.ElementTree as ET
 from datetime import timedelta
 
 from homeassistant.components import mqtt
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
 )
@@ -18,20 +17,15 @@ from .isapi import HikvisionISAPIClient
 
 _LOGGER = logging.getLogger(__name__)
 
-# Event types that indicate a doorbell ring
+# Event types from the ISAPI alertStream that indicate a doorbell ring.
+# These are matched case-insensitively against the <eventType> XML value.
 _RING_EVENT_TYPES = {
-    "videoloss",
     "videointercom",
     "callstatus",
     "doorbell",
+    "videointercomevent",
+    "videointercomalarm",
 }
-
-# Patterns in the raw event XML/text that indicate a ring
-_RING_PATTERNS = re.compile(
-    r"(videoloss|VideoIntercom|callStatus|doorbell|ringing|"
-    r"DOORBELL_RINGING|callincoming)",
-    re.IGNORECASE,
-)
 
 
 class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
@@ -71,11 +65,26 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
 
         def _on_alert_event(raw_event: str) -> None:
             """Called from the executor thread when an alert event arrives."""
-            _LOGGER.debug("Alert stream event: %s", raw_event[:500])
-            if self._is_ring_event(raw_event):
+            event_type = self._extract_event_type(raw_event)
+            _LOGGER.info(
+                "Alert stream event received - eventType=%s, raw length=%d",
+                event_type or "unknown",
+                len(raw_event),
+            )
+
+            if self._is_ring_event(event_type, raw_event):
+                _LOGGER.info(
+                    "Ring event detected (eventType=%s)!", event_type
+                )
                 self.hass.loop.call_soon_threadsafe(
                     self.hass.async_create_task,
                     self._handle_ring_from_stream(),
+                )
+            else:
+                _LOGGER.info(
+                    "Non-ring event from stream: eventType=%s, data=%s",
+                    event_type,
+                    raw_event[:300],
                 )
 
         await self.client.start_alert_stream(_on_alert_event)
@@ -84,31 +93,39 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         )
 
     @staticmethod
-    def _is_ring_event(raw_event: str) -> bool:
-        """Determine if the raw event data indicates a doorbell ring."""
-        # Check with regex for known ring indicators
-        if _RING_PATTERNS.search(raw_event):
-            return True
-
-        # Try to parse XML for structured event detection
+    def _extract_event_type(raw_event: str) -> str | None:
+        """Extract the eventType from the raw event XML."""
         try:
-            # Extract just the XML portion if it's wrapped in multipart
-            xml_start = raw_event.find("<?xml")
-            if xml_start == -1:
-                xml_start = raw_event.find("<EventNotificationAlert")
+            xml_start = raw_event.find("<EventNotificationAlert")
+            if xml_start < 0:
+                xml_start = raw_event.find("<?xml")
             if xml_start >= 0:
                 xml_text = raw_event[xml_start:]
                 root = ET.fromstring(xml_text)
                 for elem in root.iter():
-                    tag = elem.tag.split("}")[-1].lower() if "}" in elem.tag else elem.tag.lower()
-                    if tag == "eventtype" and elem.text:
-                        event_type = elem.text.strip().lower()
-                        if event_type in _RING_EVENT_TYPES:
-                            return True
+                    tag = (
+                        elem.tag.split("}")[-1]
+                        if "}" in elem.tag
+                        else elem.tag
+                    )
+                    if tag.lower() == "eventtype" and elem.text:
+                        return elem.text.strip()
         except ET.ParseError:
-            pass
+            _LOGGER.debug("Could not parse event XML: %s", raw_event[:200])
+        return None
 
-        return False
+    @staticmethod
+    def _is_ring_event(event_type: str | None, raw_event: str) -> bool:
+        """Determine if the event indicates a doorbell ring."""
+        if event_type:
+            if event_type.lower() in _RING_EVENT_TYPES:
+                return True
+        # Fallback: check raw text for ring indicators
+        lower = raw_event.lower()
+        return any(
+            kw in lower
+            for kw in ("ringing", "doorbell_ringing", "callincoming", "callstatus")
+        )
 
     async def _handle_ring_from_stream(self) -> None:
         """Handle a ring event from the alert stream."""

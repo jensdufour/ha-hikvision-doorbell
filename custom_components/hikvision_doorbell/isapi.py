@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import socket
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -10,6 +11,12 @@ from functools import partial
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+
+# Alert stream URL paths to try (primary first, fallback for older firmware)
+_ALERT_STREAM_PATHS = (
+    "/ISAPI/Event/notification/alertStream",
+    "/Event/notification/alertStream",
+)
 
 
 class HikvisionISAPIError(Exception):
@@ -145,60 +152,100 @@ class HikvisionISAPIClient:
     def _sync_listen_alert_stream(
         self, callback: Callable[[str], None]
     ) -> None:
-        """Listen to the ISAPI alert stream (blocking). Calls callback with event XML."""
-        url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
+        """Listen to the ISAPI alert stream (blocking).
+
+        Uses line-by-line reading (like pyhik) to avoid blocking on
+        partial buffer fills. Scans for <EventNotificationAlert> XML
+        envelopes and passes complete events to the callback.
+        """
         opener = self._build_opener()
-        try:
-            response = opener.open(url, timeout=300)
-        except Exception as err:
-            _LOGGER.warning("Failed to open alert stream: %s", err)
+        response = None
+
+        # Try each alert stream path
+        for path in _ALERT_STREAM_PATHS:
+            url = f"{self._base_url}{path}"
+            try:
+                response = opener.open(url, timeout=60)
+                _LOGGER.info(
+                    "Alert stream connected: %s (status %s)",
+                    path,
+                    response.status,
+                )
+                break
+            except urllib.error.HTTPError as err:
+                _LOGGER.warning(
+                    "Alert stream %s returned HTTP %s, trying next path",
+                    path,
+                    err.code,
+                )
+                continue
+            except Exception as err:
+                _LOGGER.warning(
+                    "Alert stream %s failed: %s, trying next path",
+                    path,
+                    err,
+                )
+                continue
+
+        if response is None:
+            _LOGGER.error(
+                "Could not open alert stream on any path. "
+                "The doorbell may not support ISAPI event streaming."
+            )
             return
 
-        buffer = b""
-        boundary = None
+        # Set a socket-level read timeout (60 seconds between lines)
+        # so readline() doesn't block forever during idle periods.
+        raw_sock = response.fp.raw
+        if hasattr(raw_sock, "_sock"):
+            raw_sock._sock.settimeout(60)
+        elif isinstance(raw_sock, socket.socket):
+            raw_sock.settimeout(60)
+
+        # Line-by-line parsing (same approach as pyhik)
+        parse_string = ""
+        in_event = False
 
         while not self._alert_stream_stop:
             try:
-                chunk = response.read(4096)
-                if not chunk:
+                line_bytes = response.readline()
+                if not line_bytes:
+                    _LOGGER.warning("Alert stream: connection closed by device")
                     break
-                buffer += chunk
 
-                # Detect the multipart boundary from the first chunk
-                if boundary is None:
-                    content_type = response.headers.get("Content-Type", "")
-                    if "boundary=" in content_type:
-                        boundary = (
-                            "--"
-                            + content_type.split("boundary=")[1].split(";")[0].strip()
-                        ).encode()
-                    else:
-                        # Try to detect from buffer
-                        for line in buffer.split(b"\r\n"):
-                            if line.startswith(b"--"):
-                                boundary = line.strip()
-                                break
-                    if boundary is None:
-                        # Not multipart, treat entire buffer as event data
-                        text = buffer.decode("utf-8", errors="replace")
-                        if "<eventType>" in text:
-                            callback(text)
-                            buffer = b""
-                        continue
+                line = line_bytes.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
 
-                # Split on boundary and process complete parts
-                parts = buffer.split(boundary)
-                # Keep the last part (may be incomplete)
-                buffer = parts[-1]
+                # Log every non-empty line at debug level for diagnostics
+                _LOGGER.debug("Alert stream line: %s", line[:300])
 
-                for part in parts[:-1]:
-                    text = part.decode("utf-8", errors="replace")
-                    if "<eventType>" in text or '"eventType"' in text:
-                        callback(text)
-            except OSError:
+                # Detect start of an EventNotificationAlert XML envelope
+                if "<EventNotificationAlert" in line:
+                    in_event = True
+                    parse_string = line
+
+                elif "</EventNotificationAlert>" in line:
+                    parse_string += " " + line
+                    in_event = False
+                    _LOGGER.info(
+                        "Alert stream received complete event: %s",
+                        parse_string[:500],
+                    )
+                    callback(parse_string)
+                    parse_string = ""
+
+                elif in_event:
+                    parse_string += " " + line
+
+            except socket.timeout:
+                # No data for 60 seconds, this is normal for idle doorbells
+                _LOGGER.debug("Alert stream: no data for 60s (keepalive)")
+                continue
+            except OSError as err:
                 if self._alert_stream_stop:
                     break
-                _LOGGER.debug("Alert stream read error, reconnecting")
+                _LOGGER.warning("Alert stream read error: %s", err)
                 break
 
     async def start_alert_stream(
@@ -208,6 +255,7 @@ class HikvisionISAPIClient:
         self._alert_stream_stop = False
 
         async def _run_stream() -> None:
+            retry_delay = 5
             while not self._alert_stream_stop:
                 loop = asyncio.get_running_loop()
                 try:
@@ -217,10 +265,16 @@ class HikvisionISAPIClient:
                     )
                 except Exception:
                     _LOGGER.warning(
-                        "Alert stream error, reconnecting in 5s", exc_info=True
+                        "Alert stream error, reconnecting in %ds",
+                        retry_delay,
+                        exc_info=True,
                     )
                 if not self._alert_stream_stop:
-                    await asyncio.sleep(5)
+                    _LOGGER.info(
+                        "Alert stream disconnected, reconnecting in %ds",
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
 
         self._alert_stream_task = asyncio.create_task(_run_stream())
 
