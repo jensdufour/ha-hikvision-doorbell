@@ -54,6 +54,11 @@ class HikvisionDoorbellSnapshotImage(ImageEntity):
     async def async_added_to_hass(self) -> None:
         """Register coordinator listener when added to hass."""
         await super().async_added_to_hass()
+        # Pick up the initial snapshot if one was fetched during setup
+        if self.coordinator.latest_snapshot is not None:
+            self._last_image = self.coordinator.latest_snapshot
+            self._last_snapshot_ref = self.coordinator.latest_snapshot
+            self._attr_image_last_updated = datetime.now()
         self.async_on_remove(
             self.coordinator.async_add_listener(self._handle_coordinator_update)
         )

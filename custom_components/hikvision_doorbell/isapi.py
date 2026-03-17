@@ -88,12 +88,35 @@ class HikvisionISAPIClient:
                 params={"format": "json"},
             )
             response.raise_for_status()
-            data = response.json()
-            return data.get("CallStatus", {}).get("status", "idle")
         except httpx.HTTPError as err:
             raise HikvisionISAPIError(
                 f"Failed to get call status: {err}"
             ) from err
+
+        # Try JSON first, fall back to XML
+        try:
+            data = response.json()
+            status = data.get("CallStatus", {}).get("status")
+            if status:
+                return status
+        except Exception:
+            _LOGGER.debug("Call status response is not JSON, trying XML")
+
+        # Try XML parsing as fallback
+        try:
+            root = ET.fromstring(response.text)
+            for prefix in (
+                "{http://www.hikvision.com/ver20/XMLSchema}",
+                "{*}",
+                "",
+            ):
+                elem = root.find(f"{prefix}status")
+                if elem is not None and elem.text:
+                    return elem.text.strip()
+        except ET.ParseError:
+            _LOGGER.debug("Call status response is not valid XML either")
+
+        return "idle"
 
     async def get_snapshot(self) -> bytes | None:
         """Capture a JPEG snapshot from the doorbell camera.

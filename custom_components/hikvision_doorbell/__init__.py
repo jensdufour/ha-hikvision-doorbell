@@ -32,6 +32,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
     await coordinator.async_config_entry_first_refresh()
 
+    # Fetch an initial snapshot so the image entity is not "unknown"
+    try:
+        snapshot = await client.get_snapshot()
+        if snapshot:
+            coordinator.latest_snapshot = snapshot
+    except Exception:
+        _LOGGER.debug("Could not fetch initial snapshot", exc_info=True)
+
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 

@@ -39,15 +39,36 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._previous_state = "idle"
         self.latest_snapshot: bytes | None = None
         self._sanitized_name = name.lower().replace(" ", "_").replace("-", "_")
+        self._consecutive_errors = 0
+        self._max_errors_before_unavailable = 5
 
     async def _async_update_data(self) -> dict:
         """Poll call status and detect state transitions."""
         try:
             current_state = await self.client.get_call_status()
+            self._consecutive_errors = 0
         except HikvisionISAPIError as err:
-            raise UpdateFailed(
-                f"Error communicating with doorbell: {err}"
-            ) from err
+            self._consecutive_errors += 1
+            _LOGGER.debug(
+                "Error polling doorbell (attempt %d/%d): %s",
+                self._consecutive_errors,
+                self._max_errors_before_unavailable,
+                err,
+            )
+            if self._consecutive_errors >= self._max_errors_before_unavailable:
+                raise UpdateFailed(
+                    f"Error communicating with doorbell: {err}"
+                ) from err
+            # Return last known state on transient errors
+            return self.data or {"call_state": "idle"}
+        except Exception as err:
+            self._consecutive_errors += 1
+            _LOGGER.warning("Unexpected error polling doorbell: %s", err)
+            if self._consecutive_errors >= self._max_errors_before_unavailable:
+                raise UpdateFailed(
+                    f"Unexpected error communicating with doorbell: {err}"
+                ) from err
+            return self.data or {"call_state": "idle"}
 
         if current_state == "ringing" and self._previous_state != "ringing":
             _LOGGER.info("Doorbell %s is ringing!", self.doorbell_name)
