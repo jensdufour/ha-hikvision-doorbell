@@ -44,44 +44,68 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._poll_count = 0
 
     async def _async_update_data(self) -> dict:
-        """Poll call status and detect state transitions."""
+        """Poll multiple endpoints and detect ring events."""
         self._poll_count += 1
+        is_ringing = False
 
+        # 1) Poll callStatus
         try:
-            current_state, raw_response = await self.client.get_call_status_raw()
+            call_state, call_raw = await self.client.get_call_status_raw()
         except Exception as err:
-            _LOGGER.debug("Error polling call status: %s", err)
-            return self.data or {"call_state": "idle"}
+            call_state, call_raw = "idle", f"error: {err}"
 
-        # Log the full raw response at WARNING level for the first 20 polls,
-        # and then whenever the state changes. This is critical for diagnostics.
-        if self._poll_count <= 20 or current_state != self._previous_state:
+        # 2) Poll callerInfo
+        try:
+            caller_state, caller_raw = await self.client.get_caller_info_raw()
+        except Exception as err:
+            caller_state, caller_raw = "idle", f"error: {err}"
+
+        # 3) Poll IO input 1 (doorStatus)
+        try:
+            io_state, io_raw = await self.client.get_io_input_status_raw("1")
+        except Exception as err:
+            io_state, io_raw = "low", f"error: {err}"
+
+        # Ring if ANY source indicates non-idle/triggered state
+        if call_state != "idle":
+            is_ringing = True
+        if caller_state != "idle":
+            is_ringing = True
+        if io_state.lower() in ("high", "active", "triggered"):
+            is_ringing = True
+
+        combined_state = (
+            f"call={call_state}, caller={caller_state}, io={io_state}"
+        )
+
+        # Log for first 20 polls and on any state change
+        if self._poll_count <= 20 or combined_state != self._previous_state:
             _LOGGER.warning(
-                "Poll #%d: call_state=%s, raw=%s",
+                "Poll #%d: %s | call_raw=%s | caller_raw=%s | io_raw=%s",
                 self._poll_count,
-                current_state,
-                raw_response[:300],
+                combined_state,
+                call_raw[:200],
+                caller_raw[:200],
+                io_raw[:200],
             )
 
-        # Detect ringing state
-        if current_state != "idle" and self._previous_state == "idle":
+        # Detect ringing transition
+        if is_ringing and not self._ringing:
             _LOGGER.warning(
-                "Doorbell %s state changed: %s -> %s",
+                "Doorbell %s RING detected! %s",
                 self.doorbell_name,
-                self._previous_state,
-                current_state,
+                combined_state,
             )
-            if not self._ringing:
-                self._ringing = True
-                await self._handle_ring()
-                if self._ring_clear_task and not self._ring_clear_task.done():
-                    self._ring_clear_task.cancel()
-                self._ring_clear_task = self.hass.async_create_task(
-                    self._clear_ringing()
-                )
+            self._ringing = True
+            await self._handle_ring()
+            if self._ring_clear_task and not self._ring_clear_task.done():
+                self._ring_clear_task.cancel()
+            self._ring_clear_task = self.hass.async_create_task(
+                self._clear_ringing()
+            )
 
-        self._previous_state = current_state
-        return {"call_state": "ringing" if self._ringing else current_state}
+        self._previous_state = combined_state
+        return {"call_state": "ringing" if self._ringing else "idle"}
 
     async def _clear_ringing(self) -> None:
         """Clear the ringing state after a delay."""

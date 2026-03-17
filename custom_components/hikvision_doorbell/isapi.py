@@ -22,6 +22,7 @@ _INTERCOM_ENDPOINTS = (
     ("/ISAPI/Event/triggers/notifications", "event triggers"),
     ("/ISAPI/Event/channels", "event channels"),
     ("/ISAPI/System/IO/inputs", "IO inputs"),
+    ("/ISAPI/System/IO/inputs/1/status", "IO input 1 status"),
 )
 
 
@@ -157,6 +158,78 @@ class HikvisionISAPIClient:
         """Get the current video intercom call status."""
         status, _ = await self.get_call_status_raw()
         return status
+
+    async def get_caller_info_raw(self) -> tuple[str, str]:
+        """Get the callerInfo status and raw response.
+
+        Returns (status_string, raw_response_text).
+        """
+        try:
+            body, _ = await self._async_request(
+                "/ISAPI/VideoIntercom/callerInfo?format=json"
+            )
+        except HikvisionISAPIError as err:
+            return "idle", f"error: {err}"
+
+        text = body.decode("utf-8", errors="replace")
+
+        try:
+            data = json.loads(text)
+            status = data.get("CallerInfo", {}).get("status")
+            if status:
+                return status, text
+        except Exception:
+            pass
+
+        # Try XML
+        try:
+            root = ET.fromstring(text)
+            for prefix in (
+                "{http://www.isapi.org/ver20/XMLSchema}",
+                "{http://www.hikvision.com/ver20/XMLSchema}",
+                "{*}",
+                "",
+            ):
+                elem = root.find(f"{prefix}status")
+                if elem is not None and elem.text:
+                    return elem.text.strip(), text
+        except ET.ParseError:
+            pass
+
+        return "idle", text
+
+    async def get_io_input_status_raw(self, input_id: str = "1") -> tuple[str, str]:
+        """Get the IO input status and raw response.
+
+        Returns (triggering_state, raw_response_text).
+        triggering_state is 'low' (inactive) or 'high' (active/triggered).
+        """
+        try:
+            body, _ = await self._async_request(
+                f"/ISAPI/System/IO/inputs/{input_id}/status"
+            )
+        except HikvisionISAPIError as err:
+            return "low", f"error: {err}"
+
+        text = body.decode("utf-8", errors="replace")
+
+        # Try XML - IOInputPort has <ioState> element
+        try:
+            root = ET.fromstring(text)
+            for prefix in (
+                "{http://www.isapi.org/ver20/XMLSchema}",
+                "{http://www.hikvision.com/ver20/XMLSchema}",
+                "{*}",
+                "",
+            ):
+                for tag in ("ioState", "IOPortStatus", "triggering"):
+                    elem = root.find(f"{prefix}{tag}")
+                    if elem is not None and elem.text:
+                        return elem.text.strip(), text
+        except ET.ParseError:
+            pass
+
+        return "low", text
 
     async def probe_endpoints(self) -> dict[str, str]:
         """Probe all known ISAPI intercom endpoints and log their responses.
