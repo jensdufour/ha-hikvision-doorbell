@@ -712,10 +712,13 @@ class HikvisionISAPIClient:
         """Enable enableCallCenter on all key configs.
 
         GET /ISAPI/VideoIntercom/keyCfg, set enableCallCenter to true,
-        PUT it back. This makes the doorbell report button presses to
-        the HTTP host (center).
+        PUT it back. Tries multiple strategies.
         """
         list_path = "/ISAPI/VideoIntercom/keyCfg"
+        single_path = "/ISAPI/VideoIntercom/keyCfg/1"
+        results: list[str] = []
+
+        # Read current config from list endpoint
         try:
             body, _ = await self._async_request(list_path)
             raw = body.decode("utf-8", errors="replace")
@@ -733,24 +736,57 @@ class HikvisionISAPIClient:
             _LOGGER.warning("keyCfg: enableCallCenter field not found")
             return "field not found"
 
+        _LOGGER.warning("keyCfg: enableCallCenter is false, will try to set true")
+
         modified_list = raw.replace(
             "<enableCallCenter>false</enableCallCenter>",
             "<enableCallCenter>true</enableCallCenter>",
         )
-        _LOGGER.warning("keyCfg: setting enableCallCenter to true")
 
-        # Strategy 1: PUT to list endpoint
+        # Strategy 1: PUT modified list XML back to list endpoint
+        _LOGGER.warning("keyCfg strategy 1: PUT to %s", list_path)
+        self._log_xml_lines("KEYCFG_STRAT1_BODY", modified_list)
         try:
             resp_body, _ = await self._async_request_with_body(
                 list_path, method="PUT", body=modified_list
             )
             resp = resp_body.decode("utf-8", errors="replace")
-            _LOGGER.warning("keyCfg list PUT response: %s", resp)
+            _LOGGER.warning("keyCfg strategy 1 OK: %s", resp[:300])
             return resp
         except HikvisionISAPIError as err:
-            _LOGGER.warning("keyCfg list PUT failed: %s -- trying individual", err)
+            _LOGGER.warning("keyCfg strategy 1 FAILED: %s", err)
+            results.append(f"s1: {err}")
 
-        # Strategy 2: Extract inner <KeyCfg> and PUT to /keyCfg/1
+        # Strategy 2: GET /keyCfg/1, modify, PUT back to /keyCfg/1
+        _LOGGER.warning("keyCfg strategy 2: GET then PUT to %s", single_path)
+        try:
+            body1, _ = await self._async_request(single_path)
+            raw1 = body1.decode("utf-8", errors="replace")
+            self._log_xml_lines("KEYCFG_1_GET", raw1)
+            if "<enableCallCenter>false</enableCallCenter>" in raw1:
+                modified1 = raw1.replace(
+                    "<enableCallCenter>false</enableCallCenter>",
+                    "<enableCallCenter>true</enableCallCenter>",
+                )
+                self._log_xml_lines("KEYCFG_STRAT2_BODY", modified1)
+                resp_body, _ = await self._async_request_with_body(
+                    single_path, method="PUT", body=modified1
+                )
+                resp = resp_body.decode("utf-8", errors="replace")
+                _LOGGER.warning("keyCfg strategy 2 OK: %s", resp[:300])
+                return resp
+            elif "<enableCallCenter>true</enableCallCenter>" in raw1:
+                _LOGGER.warning("keyCfg/1: already true")
+                return "already enabled"
+            else:
+                _LOGGER.warning("keyCfg/1: enableCallCenter not in response")
+                results.append("s2: field not in /keyCfg/1")
+        except HikvisionISAPIError as err:
+            _LOGGER.warning("keyCfg strategy 2 FAILED: %s", err)
+            results.append(f"s2: {err}")
+
+        # Strategy 3: Extract inner <KeyCfg> from list, strip xmlns, PUT to /keyCfg/1
+        _LOGGER.warning("keyCfg strategy 3: extracted inner element PUT to %s", single_path)
         match = _re.search(
             r"(<KeyCfg[^L][^>]*>.*?</KeyCfg>)", raw, _re.DOTALL
         )
@@ -760,33 +796,57 @@ class HikvisionISAPIClient:
                 "<enableCallCenter>false</enableCallCenter>",
                 "<enableCallCenter>true</enableCallCenter>",
             )
+            # Try with original attributes
             single_body = f'<?xml version="1.0" encoding="UTF-8"?>\n{inner}'
-            self._log_xml_lines("KEYCFG_SINGLE_PUT", single_body)
+            self._log_xml_lines("KEYCFG_STRAT3_BODY", single_body)
             try:
                 resp_body, _ = await self._async_request_with_body(
-                    "/ISAPI/VideoIntercom/keyCfg/1",
-                    method="PUT",
-                    body=single_body,
+                    single_path, method="PUT", body=single_body
                 )
                 resp = resp_body.decode("utf-8", errors="replace")
-                _LOGGER.warning("keyCfg/1 PUT response: %s", resp)
+                _LOGGER.warning("keyCfg strategy 3 OK: %s", resp[:300])
                 return resp
             except HikvisionISAPIError as err:
-                _LOGGER.warning("keyCfg/1 PUT failed: %s", err)
+                _LOGGER.warning("keyCfg strategy 3 FAILED: %s", err)
+                results.append(f"s3: {err}")
 
-        # Strategy 3: Try POST instead of PUT
-        for path in (list_path, "/ISAPI/VideoIntercom/keyCfg/1"):
+            # Try stripped of version/xmlns attributes
+            stripped = _re.sub(r'\s+version="[^"]*"', '', inner)
+            stripped = _re.sub(r'\s+xmlns="[^"]*"', '', stripped)
+            stripped_body = f'<?xml version="1.0" encoding="UTF-8"?>\n{stripped}'
+            _LOGGER.warning("keyCfg strategy 3b: stripped attrs PUT to %s", single_path)
+            self._log_xml_lines("KEYCFG_STRAT3B_BODY", stripped_body)
+            try:
+                resp_body, _ = await self._async_request_with_body(
+                    single_path, method="PUT", body=stripped_body
+                )
+                resp = resp_body.decode("utf-8", errors="replace")
+                _LOGGER.warning("keyCfg strategy 3b OK: %s", resp[:300])
+                return resp
+            except HikvisionISAPIError as err:
+                _LOGGER.warning("keyCfg strategy 3b FAILED: %s", err)
+                results.append(f"s3b: {err}")
+        else:
+            _LOGGER.warning("keyCfg strategy 3: could not extract inner KeyCfg")
+            results.append("s3: no regex match")
+
+        # Strategy 4: POST to both endpoints
+        for path in (single_path, list_path):
+            _LOGGER.warning("keyCfg strategy 4: POST to %s", path)
             try:
                 resp_body, _ = await self._async_request_with_body(
                     path, method="POST", body=modified_list,
                 )
                 resp = resp_body.decode("utf-8", errors="replace")
-                _LOGGER.warning("keyCfg POST %s response: %s", path, resp)
+                _LOGGER.warning("keyCfg strategy 4 POST %s OK: %s", path, resp[:300])
                 return resp
             except HikvisionISAPIError as err:
-                _LOGGER.warning("keyCfg POST %s failed: %s", path, err)
+                _LOGGER.warning("keyCfg strategy 4 POST %s FAILED: %s", path, err)
+                results.append(f"s4-{path}: {err}")
 
-        return "all keyCfg update attempts failed"
+        summary = " | ".join(results)
+        _LOGGER.warning("keyCfg ALL strategies failed: %s", summary)
+        return f"all keyCfg update attempts failed: {summary}"
 
     # ------------------------------------------------------------------
     # alertStream - persistent streaming connection

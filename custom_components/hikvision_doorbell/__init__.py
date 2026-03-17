@@ -19,10 +19,12 @@ from .isapi import HikvisionISAPIClient, HikvisionISAPIError
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["binary_sensor", "image"]
+_VERSION = "1.2.5"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Hikvision Doorbell from a config entry."""
+    _LOGGER.warning("Hikvision Doorbell integration v%s loading", _VERSION)
     client = HikvisionISAPIClient(
         host=entry.data["host"],
         username=entry.data["username"],
