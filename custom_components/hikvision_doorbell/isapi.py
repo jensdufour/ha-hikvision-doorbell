@@ -360,74 +360,103 @@ class HikvisionISAPIClient:
         Strategy: GET the current config, modify only the fields we need,
         and PUT it back. This avoids XML format mismatches.
         """
-        # Step 1: GET the current configuration
+        import re
+
+        # Step 1: GET the current full list configuration
         try:
             body, _ = await self._async_request(
-                f"/ISAPI/Event/notification/httpHosts/{host_id}"
+                "/ISAPI/Event/notification/httpHosts"
             )
             current_xml = body.decode("utf-8", errors="replace")
-        except HikvisionISAPIError:
-            # Single-host GET failed, try getting the list
-            try:
-                body, _ = await self._async_request(
-                    "/ISAPI/Event/notification/httpHosts"
-                )
-                current_xml = body.decode("utf-8", errors="replace")
-            except HikvisionISAPIError as err:
-                return f"error getting config: {err}"
+        except HikvisionISAPIError as err:
+            return f"error getting config: {err}"
 
         _LOGGER.warning("Current HTTP host XML to modify:\n%s", current_xml)
 
-        # Step 2: Extract the single HttpHostNotification element
-        # If we got the list, extract just the notification for our host_id
-        import re
+        # Step 2: Modify the fields in the full XML directly
+        # Use negative lookahead (?!List) to avoid matching the wrapper tag
+        modified_xml = current_xml
 
-        # Find the HttpHostNotification block
+        # Replace url (empty or existing)
+        modified_xml = re.sub(
+            r"<url>[^<]*</url>",
+            f"<url>{url_path}</url>",
+            modified_xml,
+        )
+        modified_xml = re.sub(
+            r"<ipAddress>[^<]*</ipAddress>",
+            f"<ipAddress>{ip}</ipAddress>",
+            modified_xml,
+        )
+        modified_xml = re.sub(
+            r"<portNo>[^<]*</portNo>",
+            f"<portNo>{port}</portNo>",
+            modified_xml,
+        )
+
+        _LOGGER.warning("Sending modified HTTP host config XML:\n%s", modified_xml)
+
+        # Step 3: Try PUT to the list endpoint first, then individual
+        for path in (
+            "/ISAPI/Event/notification/httpHosts",
+            f"/ISAPI/Event/notification/httpHosts/{host_id}",
+        ):
+            for method in ("PUT",):
+                try:
+                    resp_body, _ = await self._async_request_with_body(
+                        path, method=method, body=modified_xml,
+                    )
+                    resp = resp_body.decode("utf-8", errors="replace")
+                    _LOGGER.warning(
+                        "HTTP host %s %s response: %s", method, path, resp
+                    )
+                    return resp
+                except HikvisionISAPIError as err:
+                    _LOGGER.warning(
+                        "HTTP host %s %s failed: %s", method, path, err
+                    )
+
+        # Step 4: Also try extracting just the inner element for individual PUT
         match = re.search(
-            r"(<HttpHostNotification[^>]*>.*?</HttpHostNotification>)",
+            r"(<HttpHostNotification(?!List)[^>]*>.*?</HttpHostNotification>)",
             current_xml,
             re.DOTALL,
         )
-        if not match:
-            _LOGGER.warning("Could not find HttpHostNotification in response")
-            return "error: no HttpHostNotification found"
-
-        notif_xml = match.group(1)
-
-        # Step 3: Replace the field values using regex
-        notif_xml = re.sub(
-            r"<url>[^<]*</url>",
-            f"<url>{url_path}</url>",
-            notif_xml,
-        )
-        notif_xml = re.sub(
-            r"<ipAddress>[^<]*</ipAddress>",
-            f"<ipAddress>{ip}</ipAddress>",
-            notif_xml,
-        )
-        notif_xml = re.sub(
-            r"<portNo>[^<]*</portNo>",
-            f"<portNo>{port}</portNo>",
-            notif_xml,
-        )
-
-        # Build the full XML with declaration
-        xml_body = f'<?xml version="1.0" encoding="UTF-8"?>\n{notif_xml}'
-
-        _LOGGER.warning("Sending modified HTTP host config XML:\n%s", xml_body)
-
-        # Step 4: PUT it back
-        try:
-            resp_body, _ = await self._async_request_with_body(
-                f"/ISAPI/Event/notification/httpHosts/{host_id}",
-                method="PUT",
-                body=xml_body,
+        if match:
+            inner_xml = match.group(1)
+            inner_xml = re.sub(
+                r"<url>[^<]*</url>",
+                f"<url>{url_path}</url>",
+                inner_xml,
             )
-            resp = resp_body.decode("utf-8", errors="replace")
-            _LOGGER.warning("HTTP host PUT response: %s", resp)
-            return resp
-        except HikvisionISAPIError as err:
-            _LOGGER.warning("HTTP host PUT failed: %s", err)
+            inner_xml = re.sub(
+                r"<ipAddress>[^<]*</ipAddress>",
+                f"<ipAddress>{ip}</ipAddress>",
+                inner_xml,
+            )
+            inner_xml = re.sub(
+                r"<portNo>[^<]*</portNo>",
+                f"<portNo>{port}</portNo>",
+                inner_xml,
+            )
+            single_body = f'<?xml version="1.0" encoding="UTF-8"?>\n{inner_xml}'
+            _LOGGER.warning(
+                "Trying individual element PUT:\n%s", single_body
+            )
+            try:
+                resp_body, _ = await self._async_request_with_body(
+                    f"/ISAPI/Event/notification/httpHosts/{host_id}",
+                    method="PUT",
+                    body=single_body,
+                )
+                resp = resp_body.decode("utf-8", errors="replace")
+                _LOGGER.warning("Individual PUT response: %s", resp)
+                return resp
+            except HikvisionISAPIError as err:
+                _LOGGER.warning("Individual PUT failed: %s", err)
+                raise
+
+        raise HikvisionISAPIError("All HTTP host configuration attempts failed")
             raise
 
     async def delete_http_host(self, host_id: str) -> None:
