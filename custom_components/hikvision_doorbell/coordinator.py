@@ -57,6 +57,7 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._consecutive_errors = 0
         self._stream_task: asyncio.Task | None = None
         self._stream_available: bool | None = None  # None = not yet probed
+        self._no_detection_warned = False
 
     async def async_start_event_stream(self) -> bool:
         """Probe and start the alert stream if available.
@@ -88,13 +89,40 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
     async def _run_event_stream(self) -> None:
         """Background task: listen to the alert stream and trigger rings."""
         reconnect_delay = 5
+        empty_attempts = 0
+        max_empty_attempts = 3
         while True:
             try:
                 _LOGGER.debug("Connecting to alert stream for %s", self.doorbell_name)
+                got_data = False
                 async for event in self.client.iter_alert_stream():
                     _LOGGER.debug("Alert stream event: %s", event)
                     await self._handle_stream_event(event)
-                    reconnect_delay = 5  # Reset on successful data
+                    got_data = True
+                    reconnect_delay = 5
+                    empty_attempts = 0
+
+                # Stream ended normally
+                if got_data:
+                    # Had data but stream closed; reconnect after short delay
+                    _LOGGER.debug(
+                        "Alert stream closed after receiving data for %s",
+                        self.doorbell_name,
+                    )
+                else:
+                    empty_attempts += 1
+                    _LOGGER.debug(
+                        "Alert stream closed without data for %s (%d/%d)",
+                        self.doorbell_name, empty_attempts, max_empty_attempts,
+                    )
+                    if empty_attempts >= max_empty_attempts:
+                        _LOGGER.warning(
+                            "Alert stream for %s closed %d times without "
+                            "data; disabling event stream",
+                            self.doorbell_name, empty_attempts,
+                        )
+                        self._stream_available = False
+                        return
             except HikvisionISAPIAuthError:
                 _LOGGER.warning(
                     "Alert stream returned 401 for %s; disabling",
@@ -106,11 +134,17 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
                 return
             except Exception as err:
                 _LOGGER.debug(
-                    "Alert stream disconnected for %s: %s, reconnecting in %ds",
-                    self.doorbell_name, err, reconnect_delay,
+                    "Alert stream error for %s: %s",
+                    self.doorbell_name, err,
                 )
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 60)
+
+            # Always wait before reconnecting
+            _LOGGER.debug(
+                "Reconnecting alert stream in %ds for %s",
+                reconnect_delay, self.doorbell_name,
+            )
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 60)
 
     async def _handle_stream_event(self, event: dict[str, str]) -> None:
         """Process a single event from the alert stream."""
@@ -140,6 +174,18 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         # If the alert stream is handling ring detection, just return state
         if self._stream_task and not self._stream_task.done():
             return {"call_state": "ringing" if self._ringing else "idle"}
+
+        # If callStatus polling is also disabled, no ring detection possible
+        if not self.client._callstatus_available:
+            if not self._no_detection_warned:
+                _LOGGER.warning(
+                    "No ring detection method available for %s. "
+                    "Both alert stream and callStatus are unavailable",
+                    self.doorbell_name,
+                )
+                self._no_detection_warned = True
+                self.update_interval = timedelta(seconds=300)
+            return {"call_state": "idle"}
 
         # Fall back to callStatus polling
         try:

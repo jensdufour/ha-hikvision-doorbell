@@ -76,6 +76,22 @@ class HikvisionISAPIClient:
                 if response.status_code == 401:
                     last_response_body = response.content
                     await client.aclose()
+                    # Detect lockout immediately to avoid further auth attempts
+                    body_text = response.content.decode("utf-8", errors="replace")
+                    if any(
+                        indicator in body_text
+                        for indicator in (
+                            "userFloor",
+                            "isIrreversive",
+                            "retryLoginTime",
+                            "invalidOperation",
+                        )
+                    ):
+                        _LOGGER.debug("Last 401 response body: %.500s", body_text)
+                        raise HikvisionISAPILockoutError(
+                            "Account is locked by the device due to too many failed "
+                            "login attempts. Wait for the lockout to expire and try again"
+                        )
                     continue
 
                 self._client = client
@@ -279,16 +295,16 @@ class HikvisionISAPIClient:
     async def check_alert_stream(self) -> bool:
         """Test whether the alert stream endpoint is accessible.
 
+        Uses a streaming request to check the status code without
+        consuming the full response body.
         Returns True if the device accepts the connection (HTTP 200),
         False on 401 or connection error.
         """
         client = self._ensure_client()
         url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
         try:
-            response = await client.get(url, timeout=5.0)
-            if response.status_code == 401:
-                return False
-            return response.status_code == 200
+            async with client.stream("GET", url, timeout=5.0) as response:
+                return response.status_code == 200
         except httpx.HTTPError:
             return False
 
@@ -305,7 +321,9 @@ class HikvisionISAPIClient:
         client = self._ensure_client()
         url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
 
-        async with client.stream("GET", url) as response:
+        # Long read timeout: the stream may be idle for minutes between events
+        stream_timeout = httpx.Timeout(10.0, read=300.0)
+        async with client.stream("GET", url, timeout=stream_timeout) as response:
             if response.status_code == 401:
                 raise HikvisionISAPIAuthError(
                     "Alert stream authentication failed"

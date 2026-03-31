@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -214,6 +215,28 @@ class TestAsyncInit:
         with patch("httpx.AsyncClient.get", side_effect=mock_get):
             with pytest.raises(HikvisionISAPILockoutError, match="locked"):
                 await client.async_init()
+
+    async def test_lockout_skips_basic_probe(self):
+        """When Digest probe shows lockout indicators, Basic probe is skipped."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        lockout_body = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ResponseStatus>
+  <subStatusCode>invalidOperation</subStatusCode>
+</ResponseStatus>"""
+
+        call_count = 0
+
+        async def mock_get(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _make_response(status_code=401, content=lockout_body)
+
+        with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            with pytest.raises(HikvisionISAPILockoutError, match="locked"):
+                await client.async_init()
+
+        # Only 1 request made (Digest only), Basic probe was skipped
+        assert call_count == 1
 
     async def test_device_info_cached_from_probe(self):
         """async_init should cache device info from the successful probe."""
@@ -536,16 +559,24 @@ class TestAlertStreamParsing:
 class TestCheckAlertStream:
     async def test_stream_available(self):
         client = _init_client()
-        mock_resp = _make_response(status_code=200)
-        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield _make_response(status_code=200)
+
+        with patch.object(client._client, "stream", side_effect=mock_stream):
             result = await client.check_alert_stream()
         assert result is True
         await client.close()
 
     async def test_stream_401(self):
         client = _init_client()
-        mock_resp = _make_response(status_code=401)
-        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield _make_response(status_code=401)
+
+        with patch.object(client._client, "stream", side_effect=mock_stream):
             result = await client.check_alert_stream()
         assert result is False
         await client.close()
@@ -553,9 +584,10 @@ class TestCheckAlertStream:
     async def test_stream_connection_error(self):
         client = _init_client()
         with patch.object(
-            client._client, "get", new_callable=AsyncMock,
+            client._client, "stream",
             side_effect=httpx.ConnectError("fail"),
         ):
             result = await client.check_alert_stream()
         assert result is False
+        await client.close()
         await client.close()
