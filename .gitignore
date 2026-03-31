@@ -5,3 +5,8 @@ dist/
 build/
 .venv/
 .env
+
+# Hikvision SDK binary libraries (user-provided, proprietary)
+hikvision_doorbell_sdk/lib-aarch64/*.so*
+hikvision_doorbell_sdk/lib-amd64/*.so*
+hikvision_doorbell_sdk/lib-*/HCNetSDKCom/

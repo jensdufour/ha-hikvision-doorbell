@@ -59,6 +59,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Falls back to callStatus polling if unavailable.
     await coordinator.async_start_event_stream()
 
+    # Subscribe to MQTT ring events from the SDK add-on (if available).
+    # This provides native SDK ring detection for devices where HTTP fails.
+    await coordinator.async_start_mqtt_listener()
+
     # Fetch an initial snapshot so the image entity is not "unknown"
     try:
         snapshot = await client.get_snapshot()

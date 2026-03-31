@@ -58,6 +58,8 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._stream_task: asyncio.Task | None = None
         self._stream_available: bool | None = None  # None = not yet probed
         self._no_detection_warned = False
+        self._mqtt_unsubscribe = None  # MQTT listener cleanup callback
+        self._mqtt_listener_active = False
 
     async def async_start_event_stream(self) -> bool:
         """Start the alert stream background task.
@@ -73,6 +75,47 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._stream_task = self.hass.async_create_task(
             self._run_event_stream()
         )
+        return True
+
+    async def async_start_mqtt_listener(self) -> bool:
+        """Subscribe to MQTT ring events from the companion SDK add-on.
+
+        The add-on publishes to 'hikvision_doorbell/{serial}/ring'.
+        This provides a third ring detection path for devices where
+        HTTP-based methods (alert stream, callStatus) do not work.
+
+        Returns True if the subscription was set up.
+        """
+        if "mqtt" not in self.hass.config.components:
+            _LOGGER.debug("MQTT integration not available, skipping SDK listener")
+            return False
+
+        serial = self.device_info_data.get("serial", "")
+        if not serial:
+            _LOGGER.debug("No serial number available, skipping MQTT listener")
+            return False
+
+        topic = f"hikvision_doorbell/{serial}/ring"
+
+        from homeassistant.components import mqtt
+        from homeassistant.core import callback
+
+        @callback
+        def _handle_mqtt_ring(msg) -> None:
+            """Handle ring event from the SDK add-on via MQTT."""
+            _LOGGER.info(
+                "Ring event received via MQTT (SDK add-on) for %s",
+                self.doorbell_name,
+            )
+            if not self._ringing:
+                self.hass.async_create_task(self._trigger_ring())
+                self.async_set_updated_data({"call_state": "ringing"})
+
+        self._mqtt_unsubscribe = await mqtt.async_subscribe(
+            self.hass, topic, _handle_mqtt_ring, qos=1
+        )
+        self._mqtt_listener_active = True
+        _LOGGER.info("Subscribed to SDK add-on MQTT topic: %s", topic)
         return True
 
     async def _run_event_stream(self) -> None:
@@ -170,14 +213,23 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         # If callStatus polling is also disabled, no ring detection possible
         if not self.client._callstatus_available:
             if not self._no_detection_warned:
-                _LOGGER.warning(
-                    "No ring detection method available for %s. "
-                    "Both alert stream and callStatus are unavailable",
-                    self.doorbell_name,
-                )
+                if self._mqtt_listener_active:
+                    _LOGGER.info(
+                        "HTTP ring detection unavailable for %s; "
+                        "using MQTT listener from SDK add-on",
+                        self.doorbell_name,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "No ring detection method available for %s. "
+                        "Both alert stream and callStatus are unavailable. "
+                        "Install the Hikvision Doorbell SDK add-on for "
+                        "native event detection via MQTT",
+                        self.doorbell_name,
+                    )
                 self._no_detection_warned = True
                 self.update_interval = timedelta(seconds=300)
-            return {"call_state": "idle"}
+            return {"call_state": "ringing" if self._ringing else "idle"}
 
         # Fall back to callStatus polling
         try:
@@ -272,6 +324,9 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
     async def async_shutdown(self) -> None:
         """Clean up on coordinator shutdown."""
         self._cancel_ring_clear_task()
+        if self._mqtt_unsubscribe:
+            self._mqtt_unsubscribe()
+            self._mqtt_unsubscribe = None
         if self._stream_task and not self._stream_task.done():
             self._stream_task.cancel()
             try:

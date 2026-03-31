@@ -1,0 +1,27 @@
+name: "Hikvision Doorbell SDK"
+description: "Native SDK ring detection for Hikvision doorbells. Publishes events via MQTT for the Hikvision Doorbell integration."
+version: "1.0.0"
+slug: "hikvision_doorbell_sdk"
+url: "https://github.com/jensdufour/ha-hikvision-doorbell"
+arch:
+  - aarch64
+  - amd64
+startup: services
+boot: auto
+init: false
+services:
+  - mqtt:need
+options:
+  doorbells:
+    - host: ""
+      port: 8000
+      username: "admin"
+      password: ""
+      name: "Doorbell"
+schema:
+  doorbells:
+    - host: str
+      port: "int(1,65535)"
+      username: str
+      password: password
+      name: str
