@@ -15,6 +15,7 @@
         "error": {
             "cannot_connect": "Failed to connect to the doorbell. Check the IP address and network.",
             "invalid_auth": "Invalid username or password.",
+            "account_locked": "Account is locked by the device due to too many failed login attempts. Wait for the lockout to expire and try again.",
             "unknown": "An unexpected error occurred."
         },
         "abort": {

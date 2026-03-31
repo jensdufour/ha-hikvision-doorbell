@@ -20,6 +20,7 @@ _isapi = importlib.import_module("isapi")
 
 HikvisionISAPIError = _isapi.HikvisionISAPIError
 HikvisionISAPIAuthError = _isapi.HikvisionISAPIAuthError
+HikvisionISAPILockoutError = _isapi.HikvisionISAPILockoutError
 HikvisionISAPIClient = _isapi.HikvisionISAPIClient
 
 # -- Sample device responses --------------------------------------------------
@@ -167,17 +168,51 @@ class TestAsyncInit:
         assert isinstance(clients_created[1], httpx.BasicAuth)
         await client.close()
 
-    async def test_both_fail_defaults_to_digest(self):
-        """If both auth methods fail, default to Digest."""
+    async def test_both_fail_raises_auth_error(self):
+        """If both auth methods return 401, async_init should raise."""
         client = HikvisionISAPIClient("192.168.1.1", "admin", "wrong")
 
         async def mock_get(url, **kwargs):
             return _make_response(status_code=401)
 
         with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            with pytest.raises(HikvisionISAPIAuthError, match="Invalid username or password"):
+                await client.async_init()
+
+    async def test_lockout_detected(self):
+        """If 401 body contains lockout indicators, raise lockout error."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        lockout_body = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ResponseStatus>
+  <statusCode>401</statusCode>
+  <subStatusCode>userFloor</subStatusCode>
+  <retryLoginTime>30</retryLoginTime>
+</ResponseStatus>"""
+
+        async def mock_get(url, **kwargs):
+            return _make_response(status_code=401, content=lockout_body)
+
+        with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            with pytest.raises(HikvisionISAPILockoutError, match="locked"):
+                await client.async_init()
+
+    async def test_device_info_cached_from_probe(self):
+        """async_init should cache device info from the successful probe."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+
+        async def mock_get(url, **kwargs):
+            return _make_response(content=DEVICE_INFO_XML)
+
+        with patch("httpx.AsyncClient.get", side_effect=mock_get):
             await client.async_init()
 
-        assert client._client is not None
+        # get_device_info should return cached data without a network call
+        info = await client.get_device_info()
+        assert info["model"] == "DS-KV8113-WME1"
+        assert info["serial"] == "DS-KV8113-WME120210101AAWRE12345678"
+
+        # Cache should be cleared after first use
+        assert client._device_info_cache is None
         await client.close()
 
 

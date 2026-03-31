@@ -9,7 +9,12 @@ from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 
 from .const import DOMAIN
-from .isapi import HikvisionISAPIAuthError, HikvisionISAPIClient, HikvisionISAPIError
+from .isapi import (
+    HikvisionISAPIAuthError,
+    HikvisionISAPIClient,
+    HikvisionISAPIError,
+    HikvisionISAPILockoutError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,6 +48,8 @@ class HikvisionDoorbellConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             try:
                 await client.async_init()
                 device_info = await client.get_device_info()
+            except HikvisionISAPILockoutError:
+                errors["base"] = "account_locked"
             except HikvisionISAPIAuthError:
                 errors["base"] = "invalid_auth"
             except HikvisionISAPIError:

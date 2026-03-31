@@ -8,7 +8,7 @@ from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN
 from .coordinator import HikvisionDoorbellCoordinator
-from .isapi import HikvisionISAPIClient, HikvisionISAPIError
+from .isapi import HikvisionISAPIClient, HikvisionISAPIError, HikvisionISAPILockoutError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +32,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device_info.get("serial"),
             device_info.get("firmware"),
         )
+    except HikvisionISAPILockoutError as err:
+        await client.close()
+        _LOGGER.warning("Doorbell account lockout detected: %s", err)
+        raise ConfigEntryNotReady(str(err)) from err
     except HikvisionISAPIError as err:
         await client.close()
         raise ConfigEntryNotReady(

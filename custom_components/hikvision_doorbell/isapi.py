@@ -18,6 +18,10 @@ class HikvisionISAPIAuthError(HikvisionISAPIError):
     """Authentication failed."""
 
 
+class HikvisionISAPILockoutError(HikvisionISAPIAuthError):
+    """Account locked by the device after too many failed attempts."""
+
+
 class HikvisionISAPIClient:
     """Async client for the Hikvision ISAPI interface.
 
@@ -34,6 +38,7 @@ class HikvisionISAPIClient:
         self._username = username
         self._password = password
         self._client: httpx.AsyncClient | None = None
+        self._device_info_cache: dict[str, Any] | None = None
 
     def _create_client(self, auth: httpx.Auth) -> httpx.AsyncClient:
         """Create an httpx client with the given auth method."""
@@ -41,13 +46,18 @@ class HikvisionISAPIClient:
             auth=auth,
             timeout=httpx.Timeout(10.0),
             verify=False,
+            follow_redirects=True,
         )
 
     async def async_init(self) -> None:
         """Probe the device to determine the correct auth method.
 
-        Tries Digest first, then Basic. Call this once during setup.
+        Tries Digest first, then Basic.  Call this once during setup.
+        Caches the device-info response so get_device_info() needs no
+        additional round-trip.  Raises on authentication failure.
         """
+        last_response_body: bytes | None = None
+
         for auth_type, auth in [
             ("Digest", httpx.DigestAuth(self._username, self._password)),
             ("Basic", httpx.BasicAuth(self._username, self._password)),
@@ -57,18 +67,44 @@ class HikvisionISAPIClient:
                 response = await client.get(
                     f"{self._base_url}/ISAPI/System/deviceInfo"
                 )
-                if response.status_code != 401:
-                    self._client = client
-                    _LOGGER.debug("Auth method resolved: %s", auth_type)
-                    return
-            except httpx.HTTPError:
-                pass
-            await client.aclose()
+                _LOGGER.debug(
+                    "Auth probe %s: HTTP %s", auth_type, response.status_code
+                )
+                if response.status_code == 401:
+                    last_response_body = response.content
+                    await client.aclose()
+                    continue
 
-        # Neither worked, default to Digest (will fail with proper error later)
-        self._client = self._create_client(
-            httpx.DigestAuth(self._username, self._password)
-        )
+                self._client = client
+                _LOGGER.debug("Auth method resolved: %s", auth_type)
+
+                # Cache device info from the successful probe response
+                if response.status_code == 200:
+                    try:
+                        self._device_info_cache = self._parse_device_info_xml(
+                            response.content
+                        )
+                    except Exception:
+                        pass  # Will be fetched again by get_device_info()
+                return
+            except httpx.HTTPError as err:
+                _LOGGER.debug("Auth probe %s error: %s", auth_type, err)
+                await client.aclose()
+
+        # Both auth methods returned 401 or failed
+        if last_response_body:
+            body_text = last_response_body.decode("utf-8", errors="replace")
+            _LOGGER.debug("Last 401 response body: %.500s", body_text)
+            if any(
+                indicator in body_text
+                for indicator in ("userFloor", "isIrreversive", "retryLoginTime")
+            ):
+                raise HikvisionISAPILockoutError(
+                    "Account is locked by the device due to too many failed "
+                    "login attempts. Wait for the lockout to expire and try again"
+                )
+
+        raise HikvisionISAPIAuthError("Invalid username or password")
 
     def _ensure_client(self) -> httpx.AsyncClient:
         """Return the client, creating a default if async_init was not called."""
@@ -109,11 +145,10 @@ class HikvisionISAPIClient:
                 f"Connection error: {err}"
             ) from err
 
-    async def get_device_info(self) -> dict[str, Any]:
-        """Get device information from the ISAPI /System/deviceInfo endpoint."""
-        body, _ = await self._request("/ISAPI/System/deviceInfo")
+    @staticmethod
+    def _parse_device_info_xml(body: bytes) -> dict[str, Any]:
+        """Parse device info XML response into a dict."""
         text = body.decode("utf-8", errors="replace")
-
         root = ET.fromstring(text)
 
         def _find_text(tag: str) -> str | None:
@@ -135,6 +170,15 @@ class HikvisionISAPIClient:
             "hardware": _find_text("hardwareVersion"),
             "mac": _find_text("macAddress"),
         }
+
+    async def get_device_info(self) -> dict[str, Any]:
+        """Get device information from the ISAPI /System/deviceInfo endpoint."""
+        if self._device_info_cache is not None:
+            info = self._device_info_cache
+            self._device_info_cache = None
+            return info
+        body, _ = await self._request("/ISAPI/System/deviceInfo")
+        return self._parse_device_info_xml(body)
 
     async def get_call_status(self) -> tuple[str, str]:
         """Get the current video intercom call status.
