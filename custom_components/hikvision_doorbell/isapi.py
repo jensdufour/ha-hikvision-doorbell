@@ -292,22 +292,6 @@ class HikvisionISAPIClient:
 
     # -- ISAPI Alert Stream (event-driven ring detection) -------------------
 
-    async def check_alert_stream(self) -> bool:
-        """Test whether the alert stream endpoint is accessible.
-
-        Uses a streaming request to check the status code without
-        consuming the full response body.
-        Returns True if the device accepts the connection (HTTP 200),
-        False on 401 or connection error.
-        """
-        client = self._ensure_client()
-        url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
-        try:
-            async with client.stream("GET", url, timeout=5.0) as response:
-                return response.status_code == 200
-        except httpx.HTTPError:
-            return False
-
     async def iter_alert_stream(self) -> AsyncGenerator[dict[str, str], None]:
         """Connect to the ISAPI alert stream and yield parsed events.
 

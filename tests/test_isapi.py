@@ -2,7 +2,6 @@
 
 import importlib
 import sys
-from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -554,40 +553,3 @@ class TestAlertStreamParsing:
         client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
         result = client._extract_alert_event("some random data")
         assert result is None
-
-
-class TestCheckAlertStream:
-    async def test_stream_available(self):
-        client = _init_client()
-
-        @asynccontextmanager
-        async def mock_stream(*args, **kwargs):
-            yield _make_response(status_code=200)
-
-        with patch.object(client._client, "stream", side_effect=mock_stream):
-            result = await client.check_alert_stream()
-        assert result is True
-        await client.close()
-
-    async def test_stream_401(self):
-        client = _init_client()
-
-        @asynccontextmanager
-        async def mock_stream(*args, **kwargs):
-            yield _make_response(status_code=401)
-
-        with patch.object(client._client, "stream", side_effect=mock_stream):
-            result = await client.check_alert_stream()
-        assert result is False
-        await client.close()
-
-    async def test_stream_connection_error(self):
-        client = _init_client()
-        with patch.object(
-            client._client, "stream",
-            side_effect=httpx.ConnectError("fail"),
-        ):
-            result = await client.check_alert_stream()
-        assert result is False
-        await client.close()
-        await client.close()

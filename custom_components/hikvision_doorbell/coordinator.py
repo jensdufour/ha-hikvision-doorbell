@@ -60,27 +60,16 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         self._no_detection_warned = False
 
     async def async_start_event_stream(self) -> bool:
-        """Probe and start the alert stream if available.
+        """Start the alert stream background task.
 
-        Returns True if the stream was started, False otherwise.
+        The task itself will determine if the stream actually works.
+        Returns True (task started). The task may disable itself later.
         """
-        try:
-            available = await self.client.check_alert_stream()
-        except Exception:
-            available = False
-
-        self._stream_available = available
-        if not available:
-            _LOGGER.debug(
-                "Alert stream not available for %s, using callStatus polling",
-                self.doorbell_name,
-            )
-            return False
-
         _LOGGER.info(
-            "Alert stream available for %s, starting event listener",
+            "Starting alert stream listener for %s",
             self.doorbell_name,
         )
+        self._stream_available = True
         self._stream_task = self.hass.async_create_task(
             self._run_event_stream()
         )
@@ -88,41 +77,44 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
 
     async def _run_event_stream(self) -> None:
         """Background task: listen to the alert stream and trigger rings."""
+        import time
+
         reconnect_delay = 5
-        empty_attempts = 0
-        max_empty_attempts = 3
+        attempt = 0
         while True:
+            attempt += 1
             try:
                 _LOGGER.debug("Connecting to alert stream for %s", self.doorbell_name)
                 got_data = False
+                start = time.monotonic()
                 async for event in self.client.iter_alert_stream():
                     _LOGGER.debug("Alert stream event: %s", event)
                     await self._handle_stream_event(event)
                     got_data = True
                     reconnect_delay = 5
-                    empty_attempts = 0
+                    attempt = 0
+                elapsed = time.monotonic() - start
 
-                # Stream ended normally
                 if got_data:
-                    # Had data but stream closed; reconnect after short delay
                     _LOGGER.debug(
                         "Alert stream closed after receiving data for %s",
                         self.doorbell_name,
                     )
-                else:
-                    empty_attempts += 1
-                    _LOGGER.debug(
-                        "Alert stream closed without data for %s (%d/%d)",
-                        self.doorbell_name, empty_attempts, max_empty_attempts,
+                elif elapsed < 2.0:
+                    # Stream returned 200 but closed almost immediately.
+                    # This firmware does not actually support the alert stream.
+                    _LOGGER.info(
+                        "Alert stream for %s closed instantly (%.1fs, no data); "
+                        "endpoint not supported, falling back to callStatus",
+                        self.doorbell_name, elapsed,
                     )
-                    if empty_attempts >= max_empty_attempts:
-                        _LOGGER.warning(
-                            "Alert stream for %s closed %d times without "
-                            "data; disabling event stream",
-                            self.doorbell_name, empty_attempts,
-                        )
-                        self._stream_available = False
-                        return
+                    self._stream_available = False
+                    return
+                else:
+                    _LOGGER.debug(
+                        "Alert stream closed without data for %s after %.1fs",
+                        self.doorbell_name, elapsed,
+                    )
             except HikvisionISAPIAuthError:
                 _LOGGER.warning(
                     "Alert stream returned 401 for %s; disabling",
