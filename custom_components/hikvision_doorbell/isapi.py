@@ -1,8 +1,10 @@
 """ISAPI client for Hikvision doorbell devices."""
 
+import asyncio
 import json
 import logging
 import xml.etree.ElementTree as ET
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
@@ -271,6 +273,124 @@ class HikvisionISAPIClient:
             except HikvisionISAPIError:
                 continue
         return None
+
+    # -- ISAPI Alert Stream (event-driven ring detection) -------------------
+
+    async def check_alert_stream(self) -> bool:
+        """Test whether the alert stream endpoint is accessible.
+
+        Returns True if the device accepts the connection (HTTP 200),
+        False on 401 or connection error.
+        """
+        client = self._ensure_client()
+        url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
+        try:
+            response = await client.get(url, timeout=5.0)
+            if response.status_code == 401:
+                return False
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
+
+    async def iter_alert_stream(self) -> AsyncGenerator[dict[str, str], None]:
+        """Connect to the ISAPI alert stream and yield parsed events.
+
+        This is a long-lived HTTP connection.  The device sends multipart
+        chunks separated by a boundary string.  Each chunk contains an XML
+        ``EventNotificationAlert`` element.
+
+        Yields dicts with keys: event_type, event_state, channel_id,
+        plus any extra fields found in the XML.
+        """
+        client = self._ensure_client()
+        url = f"{self._base_url}/ISAPI/Event/notification/alertStream"
+
+        async with client.stream("GET", url) as response:
+            if response.status_code == 401:
+                raise HikvisionISAPIAuthError(
+                    "Alert stream authentication failed"
+                )
+            response.raise_for_status()
+
+            buffer = ""
+            async for chunk in response.aiter_text():
+                buffer += chunk
+                # Split on multipart boundaries (any line starting with --)
+                while True:
+                    event_dict = self._extract_alert_event(buffer)
+                    if event_dict is None:
+                        break
+                    event_dict, buffer = event_dict
+                    yield event_dict
+
+    def _extract_alert_event(
+        self, buffer: str
+    ) -> tuple[dict[str, str], str] | None:
+        """Try to extract one complete XML event from the buffer.
+
+        Returns (parsed_event_dict, remaining_buffer) or None if no
+        complete event is available yet.
+        """
+        # Look for a complete XML document between boundaries
+        xml_start = buffer.find("<EventNotificationAlert")
+        if xml_start == -1:
+            return None
+
+        xml_end = buffer.find("</EventNotificationAlert>", xml_start)
+        if xml_end == -1:
+            return None
+
+        xml_end += len("</EventNotificationAlert>")
+        xml_text = buffer[xml_start:xml_end]
+        remaining = buffer[xml_end:]
+
+        try:
+            return self._parse_alert_xml(xml_text), remaining
+        except ET.ParseError:
+            _LOGGER.debug("Failed to parse alert XML: %.200s", xml_text)
+            return None
+
+    @staticmethod
+    def _parse_alert_xml(xml_text: str) -> dict[str, str]:
+        """Parse an EventNotificationAlert XML fragment into a dict."""
+        root = ET.fromstring(xml_text)
+        result: dict[str, str] = {}
+
+        for tag in (
+            "eventType",
+            "eventState",
+            "eventDescription",
+            "channelID",
+            "activePostCount",
+        ):
+            for prefix in (
+                "{http://www.hikvision.com/ver20/XMLSchema}",
+                "{http://www.std-cgi.com/ver10/XMLSchema}",
+                "{*}",
+                "",
+            ):
+                elem = root.find(f"{prefix}{tag}")
+                if elem is not None and elem.text:
+                    result[tag] = elem.text.strip()
+                    break
+
+        # Check for nested VideoInterEvent / VideoIntercom elements
+        for nested_tag in ("VideoInterEvent", "VideoIntercom"):
+            for prefix in (
+                "{http://www.hikvision.com/ver20/XMLSchema}",
+                "{http://www.std-cgi.com/ver10/XMLSchema}",
+                "{*}",
+                "",
+            ):
+                nested = root.find(f"{prefix}{nested_tag}")
+                if nested is not None:
+                    for child in nested:
+                        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                        if child.text:
+                            result[f"{nested_tag}.{local}"] = child.text.strip()
+                    break
+
+        return result
 
     async def close(self) -> None:
         """Close the HTTP client."""

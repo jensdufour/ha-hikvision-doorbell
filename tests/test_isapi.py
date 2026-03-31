@@ -459,3 +459,103 @@ class TestClose:
         """Closing a client that was never initialized should not error."""
         client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
         await client.close()  # Should not raise
+
+
+# -- Test alert stream parsing -------------------------------------------------
+
+ALERT_RING_XML = """\
+<EventNotificationAlert xmlns="http://www.hikvision.com/ver20/XMLSchema">
+  <eventType>VideoIntercom</eventType>
+  <eventState>active</eventState>
+  <channelID>1</channelID>
+  <eventDescription>doorbell ring</eventDescription>
+</EventNotificationAlert>
+"""
+
+ALERT_NESTED_XML = """\
+<EventNotificationAlert xmlns="http://www.hikvision.com/ver20/XMLSchema">
+  <eventType>videointercomevent</eventType>
+  <eventState>active</eventState>
+  <VideoInterEvent xmlns="http://www.hikvision.com/ver20/XMLSchema">
+    <eventType>callingDevice</eventType>
+  </VideoInterEvent>
+</EventNotificationAlert>
+"""
+
+ALERT_MOTION_XML = """\
+<EventNotificationAlert>
+  <eventType>VMD</eventType>
+  <eventState>active</eventState>
+  <channelID>1</channelID>
+</EventNotificationAlert>
+"""
+
+
+class TestAlertStreamParsing:
+    def test_parse_ring_event(self):
+        result = HikvisionISAPIClient._parse_alert_xml(ALERT_RING_XML)
+        assert result["eventType"] == "VideoIntercom"
+        assert result["eventState"] == "active"
+        assert result["channelID"] == "1"
+        assert result["eventDescription"] == "doorbell ring"
+
+    def test_parse_nested_video_inter_event(self):
+        result = HikvisionISAPIClient._parse_alert_xml(ALERT_NESTED_XML)
+        assert result["eventType"] == "videointercomevent"
+        assert result["eventState"] == "active"
+        assert result["VideoInterEvent.eventType"] == "callingDevice"
+
+    def test_parse_motion_event(self):
+        result = HikvisionISAPIClient._parse_alert_xml(ALERT_MOTION_XML)
+        assert result["eventType"] == "VMD"
+        assert result["eventState"] == "active"
+
+    def test_extract_event_from_buffer(self):
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        buffer = f"--boundary\r\nContent-Type: application/xml\r\n\r\n{ALERT_RING_XML}\r\n--boundary"
+        result = client._extract_alert_event(buffer)
+        assert result is not None
+        event, remaining = result
+        assert event["eventType"] == "VideoIntercom"
+        assert "--boundary" in remaining
+
+    def test_extract_event_incomplete(self):
+        """Incomplete XML should return None."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        buffer = "--boundary\r\n<EventNotificationAlert><eventType>VMD</eventType>"
+        result = client._extract_alert_event(buffer)
+        assert result is None
+
+    def test_extract_no_event(self):
+        """Buffer with no XML at all."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        result = client._extract_alert_event("some random data")
+        assert result is None
+
+
+class TestCheckAlertStream:
+    async def test_stream_available(self):
+        client = _init_client()
+        mock_resp = _make_response(status_code=200)
+        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
+            result = await client.check_alert_stream()
+        assert result is True
+        await client.close()
+
+    async def test_stream_401(self):
+        client = _init_client()
+        mock_resp = _make_response(status_code=401)
+        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
+            result = await client.check_alert_stream()
+        assert result is False
+        await client.close()
+
+    async def test_stream_connection_error(self):
+        client = _init_client()
+        with patch.object(
+            client._client, "get", new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("fail"),
+        ):
+            result = await client.check_alert_stream()
+        assert result is False
+        await client.close()
