@@ -19,7 +19,11 @@ class HikvisionISAPIAuthError(HikvisionISAPIError):
 
 
 class HikvisionISAPIClient:
-    """Async client for the Hikvision ISAPI interface using HTTP Digest auth."""
+    """Async client for the Hikvision ISAPI interface.
+
+    Tries Digest auth first, falls back to Basic auth if Digest fails with 401.
+    Some Hikvision devices only support Basic, others only Digest.
+    """
 
     def __init__(self, host: str, username: str, password: str) -> None:
         if not host.startswith(("http://", "https://")):
@@ -27,8 +31,11 @@ class HikvisionISAPIClient:
         else:
             base_url = host
         self._base_url = base_url.rstrip("/")
+        self._username = username
+        self._password = password
+        self._auth: httpx.Auth = httpx.DigestAuth(username, password)
+        self._auth_resolved = False
         self._client = httpx.AsyncClient(
-            auth=httpx.DigestAuth(username, password),
             timeout=httpx.Timeout(10.0),
             verify=False,
         )
@@ -37,14 +44,28 @@ class HikvisionISAPIClient:
         """Make an authenticated async request to the device."""
         url = f"{self._base_url}{path}"
         try:
-            response = await self._client.get(url, timeout=timeout)
-            if response.status_code == 401:
+            response = await self._client.get(url, auth=self._auth, timeout=timeout)
+
+            # If Digest auth failed and we haven't locked in an auth method yet,
+            # retry with Basic auth (some Hikvision devices only support Basic).
+            if response.status_code == 401 and not self._auth_resolved:
+                _LOGGER.debug("Digest auth returned 401, trying Basic auth")
+                self._auth = httpx.BasicAuth(self._username, self._password)
+                response = await self._client.get(url, auth=self._auth, timeout=timeout)
+                if response.status_code == 401:
+                    raise HikvisionISAPIAuthError("Invalid credentials")
+                self._auth_resolved = True
+                _LOGGER.debug("Basic auth succeeded, using it for future requests")
+            elif response.status_code == 401:
                 raise HikvisionISAPIAuthError("Invalid credentials")
+            else:
+                self._auth_resolved = True
+
             response.raise_for_status()
             return response.content, dict(response.headers)
+        except HikvisionISAPIError:
+            raise
         except httpx.HTTPStatusError as err:
-            if err.response.status_code == 401:
-                raise HikvisionISAPIAuthError("Invalid credentials") from err
             raise HikvisionISAPIError(
                 f"HTTP {err.response.status_code} requesting {path}"
             ) from err

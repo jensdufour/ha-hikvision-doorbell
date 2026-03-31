@@ -135,11 +135,59 @@ class TestGetDeviceInfo:
         await client.close()
 
     async def test_auth_failure_raises(self):
+        """Both Digest and Basic auth fail -> HikvisionISAPIAuthError."""
         client = HikvisionISAPIClient("192.168.1.1", "admin", "wrong")
         mock_resp = _make_response(status_code=401)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             with pytest.raises(HikvisionISAPIAuthError):
                 await client.get_device_info()
+        await client.close()
+
+    async def test_auth_fallback_digest_to_basic(self):
+        """Digest auth returns 401 but Basic auth succeeds."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        call_count = 0
+
+        async def mock_get(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            auth = kwargs.get("auth")
+            # First call uses DigestAuth -> 401
+            if isinstance(auth, httpx.DigestAuth):
+                return _make_response(status_code=401)
+            # Second call uses BasicAuth -> success
+            return _make_response(content=DEVICE_INFO_XML)
+
+        with patch.object(client._client, "get", side_effect=mock_get):
+            info = await client.get_device_info()
+
+        assert info["model"] == "DS-KV8113-WME1"
+        assert call_count == 2
+        assert isinstance(client._auth, httpx.BasicAuth)
+        assert client._auth_resolved
+        await client.close()
+
+    async def test_auth_method_cached_after_success(self):
+        """Once auth method is resolved, subsequent requests use it directly."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        # Simulate that auth was already resolved to DigestAuth
+        client._auth_resolved = True
+        mock_resp = _make_response(content=DEVICE_INFO_XML)
+        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+            await client.get_device_info()
+        # Only one call (no fallback retry)
+        mock_get.assert_called_once()
+        await client.close()
+
+    async def test_auth_resolved_no_retry_on_401(self):
+        """After auth is resolved, 401 raises immediately without retrying."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client._auth_resolved = True
+        mock_resp = _make_response(status_code=401)
+        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+            with pytest.raises(HikvisionISAPIAuthError):
+                await client.get_device_info()
+        mock_get.assert_called_once()
         await client.close()
 
     async def test_connection_error_raises(self):
