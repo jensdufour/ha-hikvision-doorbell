@@ -1,13 +1,11 @@
 """ISAPI client for Hikvision doorbell devices."""
 
-import asyncio
 import json
 import logging
-import urllib.error
-import urllib.request
 import xml.etree.ElementTree as ET
-from functools import partial
 from typing import Any
+
+import httpx
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,61 +19,51 @@ class HikvisionISAPIAuthError(HikvisionISAPIError):
 
 
 class HikvisionISAPIClient:
-    """Client for the Hikvision ISAPI interface using HTTP Digest auth.
-
-    Uses urllib which has built-in, reliable HTTPDigestAuthHandler support.
-    All requests run in the executor to avoid blocking the event loop.
-    """
+    """Async client for the Hikvision ISAPI interface using HTTP Digest auth."""
 
     def __init__(self, host: str, username: str, password: str) -> None:
-        self._base_url = f"http://{host}"
-        self._username = username
-        self._password = password
-
-    def _build_opener(self) -> urllib.request.OpenerDirector:
-        """Build a urllib opener with Digest + Basic auth support."""
-        password_mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-        password_mgr.add_password(
-            None, self._base_url, self._username, self._password
+        if not host.startswith(("http://", "https://")):
+            base_url = f"http://{host}"
+        else:
+            base_url = host
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(
+            auth=httpx.DigestAuth(username, password),
+            timeout=httpx.Timeout(10.0),
+            verify=False,
         )
-        digest_handler = urllib.request.HTTPDigestAuthHandler(password_mgr)
-        basic_handler = urllib.request.HTTPBasicAuthHandler(password_mgr)
-        return urllib.request.build_opener(digest_handler, basic_handler)
 
-    def _sync_request(self, path: str, timeout: int = 10) -> tuple[bytes, dict]:
-        """Make a synchronous HTTP request with auth. Returns (body, headers)."""
+    async def _request(self, path: str, timeout: float = 10.0) -> tuple[bytes, dict[str, str]]:
+        """Make an authenticated async request to the device."""
         url = f"{self._base_url}{path}"
-        opener = self._build_opener()
         try:
-            response = opener.open(url, timeout=timeout)
-            body = response.read()
-            headers = dict(response.headers)
-            return body, headers
-        except urllib.error.HTTPError as err:
-            if err.code == 401:
+            response = await self._client.get(url, timeout=timeout)
+            if response.status_code == 401:
+                raise HikvisionISAPIAuthError("Invalid credentials")
+            response.raise_for_status()
+            return response.content, dict(response.headers)
+        except httpx.HTTPStatusError as err:
+            if err.response.status_code == 401:
                 raise HikvisionISAPIAuthError("Invalid credentials") from err
             raise HikvisionISAPIError(
-                f"HTTP {err.code} requesting {path}"
+                f"HTTP {err.response.status_code} requesting {path}"
             ) from err
-        except urllib.error.URLError as err:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as err:
             raise HikvisionISAPIError(
-                f"Cannot connect to {self._base_url}: {err.reason}"
+                f"Cannot connect to {self._base_url}: {err}"
             ) from err
-        except OSError as err:
+        except httpx.TimeoutException as err:
+            raise HikvisionISAPIError(
+                f"Timeout requesting {path}: {err}"
+            ) from err
+        except httpx.HTTPError as err:
             raise HikvisionISAPIError(
                 f"Connection error: {err}"
             ) from err
 
-    async def _async_request(self, path: str, timeout: int = 10) -> tuple[bytes, dict]:
-        """Run a request in the executor to avoid blocking the event loop."""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, partial(self._sync_request, path, timeout)
-        )
-
     async def get_device_info(self) -> dict[str, Any]:
         """Get device information from the ISAPI /System/deviceInfo endpoint."""
-        body, _ = await self._async_request("/ISAPI/System/deviceInfo")
+        body, _ = await self._request("/ISAPI/System/deviceInfo")
         text = body.decode("utf-8", errors="replace")
 
         root = ET.fromstring(text)
@@ -103,17 +91,14 @@ class HikvisionISAPIClient:
     async def get_call_status(self) -> tuple[str, str]:
         """Get the current video intercom call status.
 
-        Polls /ISAPI/VideoIntercom/callStatus?format=json which returns
-        "idle", "ring", or "onCall".
-
         Returns (status, raw_response_text).
-        Raises HikvisionISAPIError on connection/auth failure.
         """
-        body, _ = await self._async_request(
+        body, _ = await self._request(
             "/ISAPI/VideoIntercom/callStatus?format=json"
         )
         text = body.decode("utf-8", errors="replace")
 
+        # Try JSON first
         try:
             data = json.loads(text)
             status = data.get("CallStatus", {}).get("status")
@@ -122,7 +107,20 @@ class HikvisionISAPIClient:
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
 
-        # Could not parse status from response
+        # Fallback: try XML parsing for firmware that ignores format=json
+        try:
+            root = ET.fromstring(text)
+            for prefix in (
+                "{http://www.hikvision.com/ver20/XMLSchema}",
+                "{*}",
+                "",
+            ):
+                elem = root.find(f"{prefix}status")
+                if elem is not None and elem.text:
+                    return elem.text.strip(), text
+        except ET.ParseError:
+            pass
+
         return "unknown", text
 
     async def get_snapshot(self) -> bytes | None:
@@ -132,18 +130,16 @@ class HikvisionISAPIClient:
         """
         for channel in ("101", "1"):
             try:
-                body, headers = await self._async_request(
+                body, headers = await self._request(
                     f"/ISAPI/Streaming/channels/{channel}/picture"
                 )
-                content_type = headers.get("Content-Type", "")
-                if content_type.startswith("image/"):
-                    return body
-                if body[:3] == b"\xff\xd8\xff":
+                content_type = headers.get("content-type", "")
+                if content_type.startswith("image/") or body[:3] == b"\xff\xd8\xff":
                     return body
             except HikvisionISAPIError:
                 continue
         return None
 
     async def close(self) -> None:
-        """Clean up resources."""
-        pass
+        """Close the HTTP client."""
+        await self._client.aclose()

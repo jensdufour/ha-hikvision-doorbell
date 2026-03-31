@@ -13,12 +13,10 @@ from .isapi import HikvisionISAPIClient, HikvisionISAPIError
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["binary_sensor", "image"]
-_VERSION = "1.4.1"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Hikvision Doorbell from a config entry."""
-    _LOGGER.warning("Hikvision Doorbell integration v%s loading", _VERSION)
     client = HikvisionISAPIClient(
         host=entry.data["host"],
         username=entry.data["username"],
@@ -27,7 +25,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         device_info = await client.get_device_info()
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Connected to doorbell: model=%s serial=%s firmware=%s",
             device_info.get("model"),
             device_info.get("serial"),
@@ -43,15 +41,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(
             f"Unexpected error connecting to doorbell: {err}"
         ) from err
-
-    # Startup diagnostic: test callStatus endpoint
-    try:
-        status, raw = await client.get_call_status()
-        _LOGGER.warning(
-            "Startup callStatus test: status=%s raw=%s", status, raw.strip()
-        )
-    except HikvisionISAPIError as err:
-        _LOGGER.warning("Startup callStatus test FAILED: %s", err)
 
     coordinator = HikvisionDoorbellCoordinator(
         hass=hass,
@@ -83,5 +72,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator: HikvisionDoorbellCoordinator = hass.data[DOMAIN].pop(
             entry.entry_id
         )
+        await coordinator.async_shutdown()
         await coordinator.client.close()
     return unload_ok
