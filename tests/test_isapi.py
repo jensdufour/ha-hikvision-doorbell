@@ -196,6 +196,25 @@ class TestAsyncInit:
             with pytest.raises(HikvisionISAPILockoutError, match="locked"):
                 await client.async_init()
 
+    async def test_lockout_detected_invalid_operation(self):
+        """Firmware that uses invalidOperation as lockout indicator."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        lockout_body = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ResponseStatus version="1.0" xmlns="http://www.std-cgi.com/ver10/XMLSchema">
+  <statusCode>4</statusCode>
+  <statusString>Invalid Operation</statusString>
+  <subStatusCode>invalidOperation</subStatusCode>
+  <errorCode>1073741830</errorCode>
+  <errorMsg>invalid operation</errorMsg>
+</ResponseStatus>"""
+
+        async def mock_get(url, **kwargs):
+            return _make_response(status_code=401, content=lockout_body)
+
+        with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            with pytest.raises(HikvisionISAPILockoutError, match="locked"):
+                await client.async_init()
+
     async def test_device_info_cached_from_probe(self):
         """async_init should cache device info from the successful probe."""
         client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
@@ -326,6 +345,23 @@ class TestGetCallStatus:
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             status, raw = await client.get_call_status()
         assert status == "idle"
+        await client.close()
+
+    async def test_callstatus_401_disables_polling(self):
+        """After all paths return 401, subsequent calls skip HTTP entirely."""
+        client = _init_client()
+        mock_resp = _make_response(status_code=401)
+        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+            # First call: tries both paths, gets 401, disables polling
+            status, raw = await client.get_call_status()
+            assert status == "idle"
+            assert not client._callstatus_available
+            first_call_count = mock_get.call_count
+
+            # Second call: no HTTP requests made at all
+            status2, raw2 = await client.get_call_status()
+            assert status2 == "idle"
+            assert mock_get.call_count == first_call_count
         await client.close()
 
     async def test_callstatus_connection_error_raises(self):

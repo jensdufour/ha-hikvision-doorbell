@@ -39,6 +39,7 @@ class HikvisionISAPIClient:
         self._password = password
         self._client: httpx.AsyncClient | None = None
         self._device_info_cache: dict[str, Any] | None = None
+        self._callstatus_available: bool = True
 
     def _create_client(self, auth: httpx.Auth) -> httpx.AsyncClient:
         """Create an httpx client with the given auth method."""
@@ -97,7 +98,12 @@ class HikvisionISAPIClient:
             _LOGGER.debug("Last 401 response body: %.500s", body_text)
             if any(
                 indicator in body_text
-                for indicator in ("userFloor", "isIrreversive", "retryLoginTime")
+                for indicator in (
+                    "userFloor",
+                    "isIrreversive",
+                    "retryLoginTime",
+                    "invalidOperation",
+                )
             ):
                 raise HikvisionISAPILockoutError(
                     "Account is locked by the device due to too many failed "
@@ -186,11 +192,15 @@ class HikvisionISAPIClient:
         Tries multiple known ISAPI paths for call status.
         Returns (status, raw_response_text).
         """
+        if not self._callstatus_available:
+            return "idle", ""
+
         paths = [
             "/ISAPI/VideoIntercom/callStatus?format=json",
             "/ISAPI/VideoIntercom/callStatus",
         ]
         last_error: Exception | None = None
+        auth_failures = 0
         for path in paths:
             try:
                 body, _ = await self._request(path)
@@ -198,6 +208,7 @@ class HikvisionISAPIClient:
                 # 401 on this endpoint means it doesn't exist or requires
                 # different permissions, not that credentials are wrong
                 # (credentials were validated during async_init).
+                auth_failures += 1
                 continue
             except HikvisionISAPIError as err:
                 last_error = err
@@ -227,6 +238,16 @@ class HikvisionISAPIClient:
                         return elem.text.strip(), text
             except ET.ParseError:
                 pass
+
+        # All paths returned 401: disable polling to prevent account lockout
+        if auth_failures == len(paths):
+            self._callstatus_available = False
+            _LOGGER.warning(
+                "callStatus endpoint returned 401 for all paths; "
+                "disabling callStatus polling to prevent account lockout. "
+                "Ring detection will not work"
+            )
+            return "idle", ""
 
         if last_error:
             raise HikvisionISAPIError(
