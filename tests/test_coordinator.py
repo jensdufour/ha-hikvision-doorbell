@@ -17,10 +17,13 @@ import pytest
 _isapi_path = Path(__file__).resolve().parent.parent / "custom_components" / "hikvision_doorbell"
 if str(_isapi_path) not in sys.path:
     sys.path.insert(0, str(_isapi_path))
+if "isapi" in sys.modules:
+    del sys.modules["isapi"]
 _isapi = importlib.import_module("isapi")
 
 HikvisionISAPIClient = _isapi.HikvisionISAPIClient
 HikvisionISAPIError = _isapi.HikvisionISAPIError
+HikvisionISAPIAuthError = _isapi.HikvisionISAPIAuthError
 
 import httpx
 
@@ -44,6 +47,10 @@ class CoordinatorStateMachine:
         try:
             status, raw = await self.client.get_call_status()
             self.consecutive_errors = 0
+        except HikvisionISAPIAuthError:
+            # 401 on callStatus = endpoint unavailable, not a real auth error
+            self.consecutive_errors = 0
+            return {"call_state": "ringing" if self.ringing else "idle"}
         except HikvisionISAPIError:
             self.consecutive_errors += 1
             if self.consecutive_errors >= 5:
@@ -83,11 +90,18 @@ CALL_STATUS_RING = b'{"CallStatus": {"status": "ring"}}'
 JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 50
 
 
+def _make_client():
+    """Create a client with the internal httpx client initialized for testing."""
+    client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+    client._ensure_client()
+    return client
+
+
 class TestRingDetectionStateMachine:
     """Test the ring detection state machine logic."""
 
     async def test_idle_stays_idle(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         resp = _make_response(content=CALL_STATUS_IDLE)
@@ -100,7 +114,7 @@ class TestRingDetectionStateMachine:
         await client.close()
 
     async def test_ring_detected(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         async def mock_get(url, **kwargs):
@@ -120,7 +134,7 @@ class TestRingDetectionStateMachine:
         await client.close()
 
     async def test_ring_to_idle_transition(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         # First: ring
@@ -147,7 +161,7 @@ class TestRingDetectionStateMachine:
 
     async def test_repeated_ring_does_not_retrigger(self):
         """While ringing, additional ring polls should not trigger new events."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         async def mock_ring(url, **kwargs):
@@ -167,7 +181,7 @@ class TestRingDetectionStateMachine:
 
     async def test_consecutive_errors_tolerated(self):
         """Up to 4 consecutive errors should be tolerated."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         with patch.object(
@@ -183,7 +197,7 @@ class TestRingDetectionStateMachine:
 
     async def test_5th_consecutive_error_raises(self):
         """The 5th consecutive error should propagate."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         with patch.object(
@@ -199,7 +213,7 @@ class TestRingDetectionStateMachine:
 
     async def test_errors_reset_on_success(self):
         """A successful poll should reset the error counter."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         # 3 failures...
@@ -220,7 +234,7 @@ class TestRingDetectionStateMachine:
 
     async def test_ringing_preserved_during_errors(self):
         """If ringing and errors occur, ringing state should be preserved."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         # Start ringing
@@ -246,7 +260,7 @@ class TestRingDetectionStateMachine:
 
     async def test_snapshot_failure_does_not_block_ring(self):
         """If snapshot capture fails, ring should still be detected."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         call_count = 0
@@ -272,7 +286,7 @@ class TestFullCycleScenarios:
 
     async def test_idle_ring_idle_ring_cycle(self):
         """Simulate a full ring cycle: idle -> ring -> idle -> ring."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _make_client()
         sm = CoordinatorStateMachine(client)
 
         responses = [

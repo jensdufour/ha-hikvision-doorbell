@@ -21,8 +21,8 @@ class HikvisionISAPIAuthError(HikvisionISAPIError):
 class HikvisionISAPIClient:
     """Async client for the Hikvision ISAPI interface.
 
-    Tries Digest auth first, falls back to Basic auth if Digest fails with 401.
-    Some Hikvision devices only support Basic, others only Digest.
+    Tries Digest auth first (most common on Hikvision devices).
+    Falls back to Basic auth during initial connection if Digest fails.
     """
 
     def __init__(self, host: str, username: str, password: str) -> None:
@@ -33,34 +33,61 @@ class HikvisionISAPIClient:
         self._base_url = base_url.rstrip("/")
         self._username = username
         self._password = password
-        self._auth: httpx.Auth = httpx.DigestAuth(username, password)
-        self._auth_resolved = False
-        self._client = httpx.AsyncClient(
+        self._client: httpx.AsyncClient | None = None
+
+    def _create_client(self, auth: httpx.Auth) -> httpx.AsyncClient:
+        """Create an httpx client with the given auth method."""
+        return httpx.AsyncClient(
+            auth=auth,
             timeout=httpx.Timeout(10.0),
             verify=False,
         )
 
+    async def async_init(self) -> None:
+        """Probe the device to determine the correct auth method.
+
+        Tries Digest first, then Basic. Call this once during setup.
+        """
+        for auth_type, auth in [
+            ("Digest", httpx.DigestAuth(self._username, self._password)),
+            ("Basic", httpx.BasicAuth(self._username, self._password)),
+        ]:
+            client = self._create_client(auth)
+            try:
+                response = await client.get(
+                    f"{self._base_url}/ISAPI/System/deviceInfo"
+                )
+                if response.status_code != 401:
+                    self._client = client
+                    _LOGGER.debug("Auth method resolved: %s", auth_type)
+                    return
+            except httpx.HTTPError:
+                pass
+            await client.aclose()
+
+        # Neither worked, default to Digest (will fail with proper error later)
+        self._client = self._create_client(
+            httpx.DigestAuth(self._username, self._password)
+        )
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        """Return the client, creating a default if async_init was not called."""
+        if self._client is None:
+            self._client = self._create_client(
+                httpx.DigestAuth(self._username, self._password)
+            )
+        return self._client
+
     async def _request(self, path: str, timeout: float = 10.0) -> tuple[bytes, dict[str, str]]:
         """Make an authenticated async request to the device."""
+        client = self._ensure_client()
         url = f"{self._base_url}{path}"
         try:
-            response = await self._client.get(url, auth=self._auth, timeout=timeout)
-
-            # If Digest auth failed and we haven't locked in an auth method yet,
-            # retry with Basic auth (some Hikvision devices only support Basic).
-            if response.status_code == 401 and not self._auth_resolved:
-                _LOGGER.debug("Digest auth returned 401, trying Basic auth")
-                self._auth = httpx.BasicAuth(self._username, self._password)
-                response = await self._client.get(url, auth=self._auth, timeout=timeout)
-                if response.status_code == 401:
-                    raise HikvisionISAPIAuthError("Invalid credentials")
-                self._auth_resolved = True
-                _LOGGER.debug("Basic auth succeeded, using it for future requests")
-            elif response.status_code == 401:
-                raise HikvisionISAPIAuthError("Invalid credentials")
-            else:
-                self._auth_resolved = True
-
+            response = await client.get(url, timeout=timeout)
+            if response.status_code == 401:
+                raise HikvisionISAPIAuthError(
+                    f"Authentication failed for {path}"
+                )
             response.raise_for_status()
             return response.content, dict(response.headers)
         except HikvisionISAPIError:
@@ -112,37 +139,56 @@ class HikvisionISAPIClient:
     async def get_call_status(self) -> tuple[str, str]:
         """Get the current video intercom call status.
 
+        Tries multiple known ISAPI paths for call status.
         Returns (status, raw_response_text).
         """
-        body, _ = await self._request(
-            "/ISAPI/VideoIntercom/callStatus?format=json"
-        )
-        text = body.decode("utf-8", errors="replace")
+        paths = [
+            "/ISAPI/VideoIntercom/callStatus?format=json",
+            "/ISAPI/VideoIntercom/callStatus",
+        ]
+        last_error: Exception | None = None
+        for path in paths:
+            try:
+                body, _ = await self._request(path)
+            except HikvisionISAPIAuthError:
+                # 401 on this endpoint means it doesn't exist or requires
+                # different permissions, not that credentials are wrong
+                # (credentials were validated during async_init).
+                continue
+            except HikvisionISAPIError as err:
+                last_error = err
+                continue
 
-        # Try JSON first
-        try:
-            data = json.loads(text)
-            status = data.get("CallStatus", {}).get("status")
-            if status:
-                return status, text
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
+            text = body.decode("utf-8", errors="replace")
 
-        # Fallback: try XML parsing for firmware that ignores format=json
-        try:
-            root = ET.fromstring(text)
-            for prefix in (
-                "{http://www.hikvision.com/ver20/XMLSchema}",
-                "{*}",
-                "",
-            ):
-                elem = root.find(f"{prefix}status")
-                if elem is not None and elem.text:
-                    return elem.text.strip(), text
-        except ET.ParseError:
-            pass
+            # Try JSON first
+            try:
+                data = json.loads(text)
+                status = data.get("CallStatus", {}).get("status")
+                if status:
+                    return status, text
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
 
-        return "unknown", text
+            # Fallback: try XML parsing for firmware that ignores format=json
+            try:
+                root = ET.fromstring(text)
+                for prefix in (
+                    "{http://www.hikvision.com/ver20/XMLSchema}",
+                    "{*}",
+                    "",
+                ):
+                    elem = root.find(f"{prefix}status")
+                    if elem is not None and elem.text:
+                        return elem.text.strip(), text
+            except ET.ParseError:
+                pass
+
+        if last_error:
+            raise HikvisionISAPIError(
+                f"callStatus unavailable: {last_error}"
+            )
+        return "idle", ""
 
     async def get_snapshot(self) -> bytes | None:
         """Capture a JPEG snapshot from the doorbell camera.
@@ -163,4 +209,6 @@ class HikvisionISAPIClient:
 
     async def close(self) -> None:
         """Close the HTTP client."""
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None

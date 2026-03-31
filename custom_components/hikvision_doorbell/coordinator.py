@@ -11,7 +11,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .const import DOMAIN, POLL_INTERVAL_SECONDS
-from .isapi import HikvisionISAPIClient, HikvisionISAPIError
+from .isapi import HikvisionISAPIAuthError, HikvisionISAPIClient, HikvisionISAPIError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +46,11 @@ class HikvisionDoorbellCoordinator(DataUpdateCoordinator):
         try:
             status, raw = await self.client.get_call_status()
             self._consecutive_errors = 0
+        except HikvisionISAPIAuthError:
+            # 401 from callStatus means the endpoint is not available on this
+            # device, not that credentials are wrong. Return idle silently.
+            self._consecutive_errors = 0
+            return {"call_state": "ringing" if self._ringing else "idle"}
         except HikvisionISAPIError as err:
             self._consecutive_errors += 1
             _LOGGER.debug(

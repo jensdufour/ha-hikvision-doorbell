@@ -41,6 +41,7 @@ class HikvisionDoorbellConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 password=user_input["password"],
             )
             try:
+                await client.async_init()
                 device_info = await client.get_device_info()
             except HikvisionISAPIAuthError:
                 errors["base"] = "invalid_auth"

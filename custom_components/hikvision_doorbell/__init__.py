@@ -24,6 +24,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     try:
+        await client.async_init()
         device_info = await client.get_device_info()
         _LOGGER.debug(
             "Connected to doorbell: model=%s serial=%s firmware=%s",

@@ -12,6 +12,10 @@ import pytest
 _isapi_path = Path(__file__).resolve().parent.parent / "custom_components" / "hikvision_doorbell"
 if str(_isapi_path) not in sys.path:
     sys.path.insert(0, str(_isapi_path))
+
+# Force reimport to pick up changes
+if "isapi" in sys.modules:
+    del sys.modules["isapi"]
 _isapi = importlib.import_module("isapi")
 
 HikvisionISAPIError = _isapi.HikvisionISAPIError
@@ -73,13 +77,19 @@ def _make_response(
     headers: dict | None = None,
 ) -> httpx.Response:
     """Create an httpx.Response for mocking."""
-    resp = httpx.Response(
+    return httpx.Response(
         status_code=status_code,
         content=content,
         headers=headers or {},
         request=httpx.Request("GET", "http://192.168.1.1/test"),
     )
-    return resp
+
+
+def _init_client(host="192.168.1.1", username="admin", password="pass"):
+    """Create a client and force-initialize the internal httpx client for testing."""
+    client = HikvisionISAPIClient(host, username, password)
+    client._ensure_client()
+    return client
 
 
 # -- Test host URL normalization -----------------------------------------------
@@ -105,12 +115,77 @@ class TestClientInit:
         client = HikvisionISAPIClient("doorbell.local", "admin", "pass")
         assert client._base_url == "http://doorbell.local"
 
+    def test_client_starts_none(self):
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        assert client._client is None
+
+
+# -- Test async_init -----------------------------------------------------------
+
+class TestAsyncInit:
+    async def test_digest_auth_succeeds(self):
+        """async_init should use Digest when device accepts it."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+
+        async def mock_get(url, **kwargs):
+            return _make_response(content=DEVICE_INFO_XML)
+
+        with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            await client.async_init()
+
+        assert client._client is not None
+        await client.close()
+
+    async def test_fallback_to_basic(self):
+        """async_init should fall back to Basic when Digest gets 401."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        clients_created = []
+
+        original_create = client._create_client
+
+        def tracking_create(auth):
+            c = original_create(auth)
+            clients_created.append(auth)
+            return c
+
+        call_count = 0
+
+        async def mock_get(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _make_response(status_code=401)  # Digest fails
+            return _make_response(content=DEVICE_INFO_XML)  # Basic succeeds
+
+        with patch.object(client, "_create_client", side_effect=tracking_create):
+            with patch("httpx.AsyncClient.get", side_effect=mock_get):
+                await client.async_init()
+
+        assert client._client is not None
+        assert len(clients_created) == 2
+        assert isinstance(clients_created[0], httpx.DigestAuth)
+        assert isinstance(clients_created[1], httpx.BasicAuth)
+        await client.close()
+
+    async def test_both_fail_defaults_to_digest(self):
+        """If both auth methods fail, default to Digest."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "wrong")
+
+        async def mock_get(url, **kwargs):
+            return _make_response(status_code=401)
+
+        with patch("httpx.AsyncClient.get", side_effect=mock_get):
+            await client.async_init()
+
+        assert client._client is not None
+        await client.close()
+
 
 # -- Test get_device_info ------------------------------------------------------
 
 class TestGetDeviceInfo:
     async def test_parse_device_info_with_namespace(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(content=DEVICE_INFO_XML)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             info = await client.get_device_info()
@@ -124,7 +199,7 @@ class TestGetDeviceInfo:
         await client.close()
 
     async def test_parse_device_info_without_namespace(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(content=DEVICE_INFO_XML_NO_NS)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             info = await client.get_device_info()
@@ -135,63 +210,15 @@ class TestGetDeviceInfo:
         await client.close()
 
     async def test_auth_failure_raises(self):
-        """Both Digest and Basic auth fail -> HikvisionISAPIAuthError."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "wrong")
+        client = _init_client(password="wrong")
         mock_resp = _make_response(status_code=401)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             with pytest.raises(HikvisionISAPIAuthError):
                 await client.get_device_info()
         await client.close()
 
-    async def test_auth_fallback_digest_to_basic(self):
-        """Digest auth returns 401 but Basic auth succeeds."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
-        call_count = 0
-
-        async def mock_get(url, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            auth = kwargs.get("auth")
-            # First call uses DigestAuth -> 401
-            if isinstance(auth, httpx.DigestAuth):
-                return _make_response(status_code=401)
-            # Second call uses BasicAuth -> success
-            return _make_response(content=DEVICE_INFO_XML)
-
-        with patch.object(client._client, "get", side_effect=mock_get):
-            info = await client.get_device_info()
-
-        assert info["model"] == "DS-KV8113-WME1"
-        assert call_count == 2
-        assert isinstance(client._auth, httpx.BasicAuth)
-        assert client._auth_resolved
-        await client.close()
-
-    async def test_auth_method_cached_after_success(self):
-        """Once auth method is resolved, subsequent requests use it directly."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
-        # Simulate that auth was already resolved to DigestAuth
-        client._auth_resolved = True
-        mock_resp = _make_response(content=DEVICE_INFO_XML)
-        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
-            await client.get_device_info()
-        # Only one call (no fallback retry)
-        mock_get.assert_called_once()
-        await client.close()
-
-    async def test_auth_resolved_no_retry_on_401(self):
-        """After auth is resolved, 401 raises immediately without retrying."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
-        client._auth_resolved = True
-        mock_resp = _make_response(status_code=401)
-        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
-            with pytest.raises(HikvisionISAPIAuthError):
-                await client.get_device_info()
-        mock_get.assert_called_once()
-        await client.close()
-
     async def test_connection_error_raises(self):
-        client = HikvisionISAPIClient("192.168.1.99", "admin", "pass")
+        client = _init_client("192.168.1.99")
         with patch.object(
             client._client, "get", new_callable=AsyncMock,
             side_effect=httpx.ConnectError("Connection refused"),
@@ -201,7 +228,7 @@ class TestGetDeviceInfo:
         await client.close()
 
     async def test_timeout_raises(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         with patch.object(
             client._client, "get", new_callable=AsyncMock,
             side_effect=httpx.ReadTimeout("timed out"),
@@ -211,7 +238,7 @@ class TestGetDeviceInfo:
         await client.close()
 
     async def test_http_500_raises(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(status_code=500)
         mock_resp.request = httpx.Request("GET", "http://192.168.1.1/ISAPI/System/deviceInfo")
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
@@ -224,7 +251,7 @@ class TestGetDeviceInfo:
 
 class TestGetCallStatus:
     async def test_json_idle(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(content=CALL_STATUS_JSON_IDLE)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             status, raw = await client.get_call_status()
@@ -233,7 +260,7 @@ class TestGetCallStatus:
         await client.close()
 
     async def test_json_ring(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(content=CALL_STATUS_JSON_RING)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             status, raw = await client.get_call_status()
@@ -242,7 +269,7 @@ class TestGetCallStatus:
 
     async def test_xml_fallback_idle(self):
         """Firmware that ignores format=json and returns XML."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(content=CALL_STATUS_XML_IDLE)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             status, raw = await client.get_call_status()
@@ -250,27 +277,31 @@ class TestGetCallStatus:
         await client.close()
 
     async def test_xml_fallback_ring(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(content=CALL_STATUS_XML_RING)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             status, raw = await client.get_call_status()
         assert status == "ring"
         await client.close()
 
-    async def test_unparseable_returns_unknown(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
-        mock_resp = _make_response(content=b"this is not json or xml")
+    async def test_callstatus_401_returns_idle(self):
+        """A 401 on callStatus means endpoint unavailable, returns idle."""
+        client = _init_client()
+        mock_resp = _make_response(status_code=401)
         with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
             status, raw = await client.get_call_status()
-        assert status == "unknown"
+        assert status == "idle"
         await client.close()
 
-    async def test_empty_json_status_returns_unknown(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
-        mock_resp = _make_response(content=b'{"CallStatus": {}}')
-        with patch.object(client._client, "get", new_callable=AsyncMock, return_value=mock_resp):
-            status, _ = await client.get_call_status()
-        assert status == "unknown"
+    async def test_callstatus_connection_error_raises(self):
+        """Connection errors on callStatus should propagate."""
+        client = _init_client()
+        with patch.object(
+            client._client, "get", new_callable=AsyncMock,
+            side_effect=httpx.ConnectError("fail"),
+        ):
+            with pytest.raises(HikvisionISAPIError, match="callStatus unavailable"):
+                await client.get_call_status()
         await client.close()
 
 
@@ -278,7 +309,7 @@ class TestGetCallStatus:
 
 class TestGetSnapshot:
     async def test_snapshot_via_content_type(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(
             content=JPEG_HEADER,
             headers={"content-type": "image/jpeg"},
@@ -290,7 +321,7 @@ class TestGetSnapshot:
 
     async def test_snapshot_via_magic_bytes(self):
         """Snapshot returned without proper content-type but has JPEG magic bytes."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(
             content=JPEG_HEADER,
             headers={"content-type": "application/octet-stream"},
@@ -302,7 +333,7 @@ class TestGetSnapshot:
 
     async def test_snapshot_fallback_to_channel_1(self):
         """Channel 101 fails, falls back to channel 1."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         call_count = 0
 
         async def mock_get(url, **kwargs):
@@ -322,7 +353,7 @@ class TestGetSnapshot:
         await client.close()
 
     async def test_snapshot_all_channels_fail(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         with patch.object(
             client._client, "get", new_callable=AsyncMock,
             side_effect=httpx.ConnectError("fail"),
@@ -333,7 +364,7 @@ class TestGetSnapshot:
 
     async def test_snapshot_non_image_skipped(self):
         """Response is not an image (wrong content-type, no JPEG magic)."""
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         mock_resp = _make_response(
             content=b"<html>error</html>",
             headers={"content-type": "text/html"},
@@ -348,7 +379,12 @@ class TestGetSnapshot:
 
 class TestClose:
     async def test_close_calls_aclose(self):
-        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        client = _init_client()
         with patch.object(client._client, "aclose", new_callable=AsyncMock) as mock_aclose:
             await client.close()
         mock_aclose.assert_called_once()
+
+    async def test_close_when_no_client(self):
+        """Closing a client that was never initialized should not error."""
+        client = HikvisionISAPIClient("192.168.1.1", "admin", "pass")
+        await client.close()  # Should not raise
